@@ -16,7 +16,12 @@ const DEFAULTS = {
   pageMode: 'dual',
   batchChars: 800,
   batchParagraphs: 6,
+  batchMinChars: 200,
   concurrency: 1,
+  requestIntervalMs: 0,
+  maxRetries: 3,
+  retryBaseMs: 600,
+  retryMaxMs: 8000,
   ignoreDomains: '',
   floatButton: true,
   targetLang: 'zh-Hans',
@@ -79,22 +84,57 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-/* ---------------- 全局低并发队列 ---------------- */
+/* ---------------- 全局有界并发调度（速率 · 退避 · 取消） ---------------- */
 
 let activeCount = 0;
 const waiting = [];
+let nextStartAt = 0;    // 全局请求起始节流：下一次允许发起请求的时间
+let cooldownUntil = 0;  // 429/5xx 触发的全局退避截止时间
+let pumpTimer = null;
 
+/** 并发上限：设置 1–3，默认沿用设置里的 1（本机单槽推理时排队比并行稳） */
 function concurrencyLimit() {
   const n = Number(settings.concurrency);
-  return Number.isFinite(n) ? Math.min(2, Math.max(1, n)) : 1;
+  return Number.isFinite(n) ? Math.min(3, Math.max(1, Math.round(n))) : 1;
+}
+
+/** 全局速率：两次请求之间至少间隔 N ms（0 = 不限制） */
+function requestIntervalMs() {
+  const n = Number(settings.requestIntervalMs);
+  return Number.isFinite(n) ? Math.min(2000, Math.max(0, Math.round(n))) : 0;
+}
+
+function abortError() {
+  const e = new Error('已中止');
+  e.code = 'aborted';
+  return e;
+}
+
+function schedulePump(delay) {
+  if (pumpTimer) return;
+  pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, Math.max(0, delay));
 }
 
 function pump() {
   while (activeCount < concurrencyLimit() && waiting.length) {
-    const job = waiting.shift();
+    const item = waiting[0];
+    if (item.aborted && item.aborted()) {
+      waiting.shift();
+      item.reject(abortError());
+      continue;
+    }
+    const now = Date.now();
+    const readyAt = Math.max(now, nextStartAt, cooldownUntil);
+    if (readyAt > now) {
+      schedulePump(readyAt - now);
+      return;
+    }
+    waiting.shift();
+    nextStartAt = now + requestIntervalMs();
     activeCount++;
-    job.fn()
-      .then(job.resolve, job.reject)
+    Promise.resolve()
+      .then(item.fn)
+      .then(item.resolve, item.reject)
       .finally(() => {
         activeCount--;
         pump();
@@ -102,16 +142,43 @@ function pump() {
   }
 }
 
-function enqueue(fn) {
+function enqueue(fn, opts = {}) {
   return new Promise((resolve, reject) => {
-    waiting.push({ fn, resolve, reject });
+    waiting.push({ fn, resolve, reject, jobId: opts.jobId, aborted: opts.aborted });
     pump();
   });
 }
 
-/* ---------------- 请求与 SSE ---------------- */
+/* 每个上层 translate 消息一个取消令牌；并发子批共用一个，cancel 一次全停 */
+const jobControls = new Map();
 
-const inflight = new Map();
+function jobControl(id) {
+  let job = jobControls.get(id);
+  if (!job) {
+    job = { ctrl: new AbortController(), cancelled: false, active: 0 };
+    jobControls.set(id, job);
+  }
+  return job;
+}
+
+function cancelJob(id) {
+  const job = jobControls.get(id);
+  if (!job) return false;
+  job.cancelled = true;
+  job.ctrl.abort();
+  let removed = 0;
+  for (let i = waiting.length - 1; i >= 0; i--) {
+    if (waiting[i].jobId === id) {
+      waiting.splice(i, 1)[0].reject(abortError());
+      removed++;
+    }
+  }
+  console.info(`[trf/cancel] id=${id} 已中止：排队取消 ${removed} 个，在途 ${job.active} 个`);
+  return true;
+}
+
+
+/* ---------------- 请求与 SSE ---------------- */
 
 /** 归一化服务地址：去掉末尾斜杠与 /v1，拼接时统一补 /v1，避免出现 /v1/v1/ */
 function normalizeBase(raw) {
@@ -285,16 +352,21 @@ function visibleProtected(text, tokens) {
 }
 
 class RequestError extends Error {
-  constructor(code, message) {
+  constructor(code, message, extra) {
     super(message);
     this.code = code;
+    if (extra) Object.assign(this, extra);
   }
 }
 
-async function chatCompletion({ id, text, count, to, src, stream, push, tabId, frameId }) {
+/** 单次 HTTP 请求（一次尝试）：流式增量只累加到本次请求自己的 acc，避免串段 */
+async function requestOnce({ id, partialId, text, count, to, src, stream, push, tabId, frameId, job }) {
   const timeoutMs = Math.max(5, Number(settings.timeoutSec) || 60) * 1000;
   const ctrl = new AbortController();
-  inflight.set(id, ctrl);
+  const onJobAbort = () => ctrl.abort();
+  job.active++;
+  if (job.ctrl.signal.aborted) ctrl.abort();
+  else job.ctrl.signal.addEventListener('abort', onJobAbort, { once: true });
 
   let timedOut = false;
   let timer = null;
@@ -340,7 +412,10 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
       try {
         detail = (await res.text()).slice(0, 200);
       } catch (e) { /* 忽略 */ }
-      throw new RequestError('http', `服务返回 HTTP ${res.status}${detail ? `：${detail}` : ''}`);
+      throw new RequestError('http', `服务返回 HTTP ${res.status}${detail ? `：${detail}` : ''}`, {
+        status: res.status,
+        retryAfter: res.headers.get('retry-after') || ''
+      });
     }
 
     const ctype = (res.headers.get('content-type') || '').toLowerCase();
@@ -366,7 +441,7 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
             acc += piece;
             if (push && tabId && Date.now() - lastPush > 150) {
               lastPush = Date.now();
-              safeSendTab(tabId, frameId, { type: 'tr-partial', id, text: visibleProtected(acc, prot.tokens) });
+              safeSendTab(tabId, frameId, { type: 'tr-partial', id: partialId || id, text: visibleProtected(acc, prot.tokens) });
             }
           }
         }
@@ -417,7 +492,7 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
       return { ok: false, code: 'aborted', error: '已中止' };
     }
     if (e instanceof RequestError) {
-      return { ok: false, code: e.code, error: e.message };
+      return { ok: false, code: e.code, error: e.message, status: e.status, retryAfter: e.retryAfter };
     }
     // fetch 网络层失败：本机多半是服务没启动，远端多半是被跨域拦下或地址不可达
     if (!isLocalEndpoint()) {
@@ -426,7 +501,302 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
     return { ok: false, code: 'disconnected', error: DISCONNECTED_HINT };
   } finally {
     clearTimeout(timer);
-    inflight.delete(id);
+    job.active--;
+    job.ctrl.signal.removeEventListener('abort', onJobAbort);
+  }
+}
+
+/* ---------------- 动态分批 · 重试 · 组装 ---------------- */
+
+function clampInt(v, lo, hi, dflt) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : dflt;
+}
+
+/** 与 content.js 一致的分段口径：优先空行，其次换行 */
+function splitSegments(text) {
+  return String(text == null ? '' : text)
+    .replace(/\r\n/g, '\n')
+    .split(/\n\s*\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function partsOf(text, count) {
+  const raw = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!raw) return [];
+  const byBlank = raw.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean);
+  if (byBlank.length === count) return byBlank;
+  const byLine = raw.split(/\n/).map((s) => s.trim()).filter(Boolean);
+  if (byLine.length === count) return byLine;
+  return byBlank.length ? byBlank : (byLine.length ? byLine : [raw]);
+}
+
+/** 超长单段按句子边界切开，尽量贴近上限；返回块数组 */
+function splitLongSegment(text, maxChars) {
+  const s = String(text || '').trim();
+  if (s.length <= maxChars) return [s];
+  const sentences = s.match(/[^.!?。！？；;\n]+[.!?。！？；;]?["'”’）)]?\s*/g) || [s];
+  const out = [];
+  let buf = '';
+  for (const sn of sentences) {
+    if (buf && (buf + sn).length > maxChars) {
+      const cut = buf.trim();
+      if (cut) out.push(cut);
+      buf = '';
+    }
+    buf += sn;
+    while (buf.length > maxChars) {
+      const cut = buf.slice(0, maxChars).trim();
+      if (cut) out.push(cut);
+      buf = buf.slice(maxChars);
+    }
+  }
+  const tail = buf.trim();
+  if (tail) out.push(tail);
+  return out.length ? out : [s];
+}
+
+function makeBatch(segs, reason) {
+  return {
+    text: segs.map((s) => s.text).join('\n\n'),
+    count: segs.length,
+    segs,
+    chunk: null,
+    reason: reason || 'pack'
+  };
+}
+
+/**
+ * 动态分批：段数与字符数双上限；长段单独成批（超上限再按句切开），
+ * 短尾批在不超过上限时并回上一批。上限取自 batchChars/batchParagraphs，
+ * 合并下限取 batchMinChars，均可通过设置调整。
+ */
+function planBatches(text, count) {
+  const maxChars = clampInt(settings.batchChars, 200, 4000, 800);
+  const maxParas = clampInt(settings.batchParagraphs, 1, 40, 6);
+  const minChars = Math.min(maxChars, clampInt(settings.batchMinChars, 50, 4000, 200));
+  const raw = String(text == null ? '' : text);
+  const segs = splitSegments(raw);
+
+  if (!segs.length) {
+    return { batches: [{ text: raw.trim(), count: Math.max(1, Number(count) || 1), segs: null, chunk: null, reason: 'raw' }], segsTotal: 0, maxChars, maxParas, minChars };
+  }
+  if (count && Number(count) > 0 && segs.length !== Number(count)) {
+    console.warn(`[trf/batch] 段数不一致：声明 ${count} 段，实际 ${segs.length} 段，回退单批请求`);
+    return { batches: [{ text: segs.join('\n\n'), count: Number(count) || segs.length, segs: null, chunk: null, reason: 'raw' }], segsTotal: segs.length, maxChars, maxParas, minChars };
+  }
+
+  const batches = [];
+  let cur = [];
+  let curLen = 0;
+  const flush = () => {
+    if (!cur.length) return;
+    batches.push(makeBatch(cur, 'pack'));
+    cur = [];
+    curLen = 0;
+  };
+
+  segs.forEach((t, i) => {
+    if (t.length > maxChars) {
+      flush();
+      const chunks = splitLongSegment(t, maxChars);
+      chunks.forEach((c) => batches.push({
+        text: c, count: 1, segs: null, reason: chunks.length > 1 ? 'split-long' : 'long-alone',
+        chunk: { segIndex: i, chunks: chunks.length }
+      }));
+      return;
+    }
+    if (cur.length >= maxParas || (curLen + t.length + 2 > maxChars && cur.length)) flush();
+    cur.push({ text: t, segIndex: i });
+    curLen += t.length + 2;
+  });
+  flush();
+
+  // 尾批过短：在不超上限时并回上一批，减少一次请求
+  if (batches.length >= 2) {
+    const a = batches[batches.length - 2];
+    const b = batches[batches.length - 1];
+    if (!a.chunk && !b.chunk && b.text.length < minChars &&
+        a.count + b.count <= maxParas && a.text.length + b.text.length + 2 <= maxChars) {
+      batches[batches.length - 2] = makeBatch(a.segs.concat(b.segs), 'merge-tail');
+      batches.pop();
+    }
+  }
+
+  const splitChunks = batches.filter((b) => b.chunk && b.chunk.chunks > 1).length;
+  console.info(`[trf/batch] 计划 segments=${segs.length} chars=${raw.length} maxChars=${maxChars} maxParas=${maxParas} minChars=${minChars} batches=${batches.length} splitChunks=${splitChunks}`);
+  if (batches.length <= 8) {
+    batches.forEach((b, i) => console.info(`[trf/batch] #${i} segs=${b.count} chars=${b.text.length} reason=${b.reason}`));
+  }
+  return { batches, segsTotal: segs.length, maxChars, maxParas, minChars };
+}
+
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
+
+function retryDelayInfo(res, attempt) {
+  const base = clampInt(settings.retryBaseMs, 100, 10000, 600);
+  const cap = Math.max(base, clampInt(settings.retryMaxMs, base, 30000, 8000));
+  let header = 0;
+  const raw = String((res && res.retryAfter) || '').trim();
+  if (raw) {
+    const sec = Number(raw);
+    if (Number.isFinite(sec) && sec >= 0) header = Math.round(sec * 1000);
+    else {
+      const at = Date.parse(raw);
+      if (Number.isFinite(at)) header = Math.max(0, at - Date.now());
+    }
+  }
+  const backoff = Math.min(cap, base * Math.pow(2, attempt));
+  return header > 0
+    ? { delay: Math.min(cap, header), source: 'retry-after' }
+    : { delay: backoff, source: 'backoff' };
+}
+
+function shouldRetry(res) {
+  if (!res) return false;
+  if (res.code === 'timeout') return true;
+  if (res.code === 'http' && RETRYABLE_STATUS.has(Number(res.status))) return true;
+  return false;
+}
+
+function sleepWithSignal(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(abortError()); return; }
+    const onAbort = () => { clearTimeout(timer); reject(abortError()); };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, Math.max(0, ms));
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** 通过全局调度器发一次批请求，带 429/5xx/超时的指数退避与全局冷却 */
+async function runLeaf(job, batch, label, msg) {
+  const maxRetries = clampInt(settings.maxRetries, 0, 5, 3);
+  let last = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (job.cancelled) return { ok: false, code: 'aborted', error: '已中止' };
+    let res;
+    try {
+      res = await enqueue(
+        () => requestOnce({
+          id: label,
+          partialId: msg.id,
+          text: batch.text,
+          count: batch.count,
+          to: msg.to,
+          src: msg.src,
+          stream: msg.stream,
+          push: !!batch.push,
+          tabId: msg.tabId,
+          frameId: msg.frameId,
+          job
+        }),
+        { jobId: msg.id, aborted: () => job.cancelled }
+      );
+    } catch (e) {
+      return { ok: false, code: 'aborted', error: '已中止' };
+    }
+    if (res && res.ok) return res;
+    last = res;
+    if (!shouldRetry(res) || attempt >= maxRetries) break;
+    const { delay, source } = retryDelayInfo(res, attempt);
+    if (Number(res.status) === 429) {
+      cooldownUntil = Math.max(cooldownUntil, Date.now() + delay);
+    }
+    console.warn(`[trf/retry] ${label} code=${res.code} status=${res.status || 0} attempt=${attempt + 1}/${maxRetries} wait=${delay}ms source=${source} concurrency=${concurrencyLimit()} inFlight=${activeCount}`);
+    try {
+      await sleepWithSignal(delay, job.ctrl.signal);
+    } catch (e) {
+      return { ok: false, code: 'aborted', error: '已中止' };
+    }
+  }
+  return last || { ok: false, code: 'internal', error: '未知请求错误' };
+}
+
+const DOWNGRADE_CODES = new Set(['timeout', 'protected', 'empty', 'mismatch']);
+
+/** 一批：请求 → 段数校验 → 失败自动二分降批（透明，对 content.js 仍是一整段结果） */
+async function runBatch(job, batch, label, msg, depth = 0) {
+  const res = await runLeaf(job, batch, label, msg);
+  if (res.ok) {
+    const parts = partsOf(res.text, batch.count);
+    if (parts.length === batch.count && parts.every((p) => String(p || '').trim())) {
+      return { ok: true, parts, ms: res.ms || 0, protected: res.protected || 0 };
+    }
+    const code = parts.length !== batch.count ? 'mismatch' : 'empty';
+    console.warn(`[trf/batch] ${label} 校验失败 code=${code} parts=${parts.length}/${batch.count}`);
+    res.ok = false;
+    res.code = code;
+    res.error = code === 'mismatch'
+      ? `译文段数与原文不一致（${parts.length}/${batch.count}）`
+      : '译文存在空段';
+  }
+  if (!res.ok && DOWNGRADE_CODES.has(res.code) && batch.segs && batch.count > 1 && depth < 3 && !job.cancelled) {
+    const mid = Math.ceil(batch.count / 2);
+    const left = makeBatch(batch.segs.slice(0, mid), 'bisect');
+    const right = makeBatch(batch.segs.slice(mid), 'bisect');
+    console.warn(`[trf/batch] 降批 ${label}: ${batch.count} 段 → ${left.count}+${right.count}（原因 ${res.code}）`);
+    const l = await runBatch(job, left, `${label}.a`, msg, depth + 1);
+    const r = await runBatch(job, right, `${label}.b`, msg, depth + 1);
+    if (l.ok && r.ok) {
+      return { ok: true, parts: l.parts.concat(r.parts), ms: l.ms + r.ms, protected: l.protected + r.protected };
+    }
+    if (job.cancelled) return { ok: false, code: 'aborted', error: '已中止' };
+    return l.ok ? r : l;
+  }
+  return res;
+}
+
+/** 并发调度下按批次并行翻译并组装回原始段序；对上层保持「一次请求一批」的返回结构 */
+async function translateInBatches(msg) {
+  const started = Date.now();
+  const job = jobControl(msg.id);
+  const plan = planBatches(msg.text, msg.count);
+  const pushable = plan.batches.length === 1 && plan.batches[0].count === 1 && !plan.batches[0].chunk;
+  const tasks = plan.batches.map((b) => ({ ...b, push: pushable && !!msg.push }));
+  console.info(`[trf/queue] id=${msg.id} 并发上限=${concurrencyLimit()} 速率间隔=${requestIntervalMs()}ms 批次=${tasks.length}`);
+
+  try {
+    const results = await Promise.all(tasks.map((b, i) => runBatch(job, b, `b${i}`, msg)));
+    if (job.cancelled) return { ok: false, code: 'aborted', error: '已中止' };
+
+    const out = [];
+    let pending = null;
+    const joiner = /^(zh|ja|ko)/i.test(String(msg.to || '')) ? '' : ' ';
+    let protectedTotal = 0;
+    for (let i = 0; i < tasks.length; i++) {
+      const r = results[i];
+      const b = tasks[i];
+      if (!r.ok) {
+        console.warn(`[trf/batch] 批次 ${i} 失败 code=${r.code}，整单返回失败`);
+        return { ok: false, code: r.code, error: r.error || '翻译失败' };
+      }
+      protectedTotal += r.protected || 0;
+      if (b.chunk) {
+        if (!pending || pending.segIndex !== b.chunk.segIndex) {
+          pending = { segIndex: b.chunk.segIndex, text: r.parts[0] || '' };
+        } else {
+          pending.text += joiner + (r.parts[0] || '');
+        }
+        continue;
+      }
+      if (pending) { out.push(pending.text); pending = null; }
+      for (const p of r.parts) out.push(p);
+    }
+    if (pending) out.push(pending.text);
+
+    const expected = Number(msg.count) > 0 ? Number(msg.count) : (plan.segsTotal || out.length);
+    if (out.length !== expected) {
+      console.warn(`[trf/batch] 组装段数不符 ${out.length}/${expected}`);
+      return { ok: false, code: 'mismatch', error: `译文段数与原文不一致（${out.length}/${expected}）` };
+    }
+    console.info(`[trf/batch] 完成 id=${msg.id} 批次=${tasks.length} 段数=${out.length} 用时=${Date.now() - started}ms`);
+    return { ok: true, text: out.join('\n\n'), ms: Date.now() - started, protected: protectedTotal };
+  } finally {
+    if (jobControls.get(msg.id) === job) jobControls.delete(msg.id);
   }
 }
 
@@ -638,15 +1008,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'translate') {
     const tabId = sender.tab && sender.tab.id;
     const frameId = sender.tab && sender.tab.id ? sender.frameId : undefined;
-    enqueue(() => chatCompletion({ ...msg, tabId, frameId }))
+    translateInBatches({ ...msg, tabId, frameId })
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, code: 'internal', error: `内部错误：${e && e.message ? e.message : e}` }));
     return true;
   }
 
   if (msg.type === 'cancel') {
-    const ctrl = inflight.get(msg.id);
-    if (ctrl) ctrl.abort();
+    cancelJob(msg.id);
     sendResponse({ ok: true });
     return false;
   }
