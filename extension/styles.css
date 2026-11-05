@@ -1,17 +1,22 @@
-/* 整页翻译：译文块样式（页面内真实 DOM，非 Shadow DOM，需要抵御站点 CSS） */
+/* 整页翻译：译文块样式（页面内真实 DOM，非 Shadow DOM，需要抵御站点 CSS）
+ * 字体/字号/行高/字距/字重/对齐/颜色由 content.js 按原文 computed style 写入 CSS 变量 */
 .trf-tr-block {
   display: block !important;
   margin: 0.45em 0 0 0 !important;
   padding: 0 0 0 0.62em !important;
   border-left: 2px solid rgba(128, 138, 168, 0.55) !important;
+  font-family: var(--trf-font-family, inherit) !important;
+  font-size: var(--trf-font-size, 0.95em) !important;
+  font-weight: var(--trf-font-weight, inherit) !important;
+  line-height: var(--trf-line-height, 1.6) !important;
+  letter-spacing: var(--trf-letter-spacing, normal) !important;
+  text-align: var(--trf-text-align, left) !important;
+  direction: var(--trf-direction, inherit) !important;
+  color: var(--trf-color, inherit) !important;
   font-style: italic !important;
   opacity: 0.86 !important;
-  font-size: 0.95em !important;
-  line-height: 1.6 !important;
   text-indent: 0 !important;
-  text-align: left !important;
   text-transform: none !important;
-  letter-spacing: normal !important;
   white-space: pre-wrap !important;
   float: none !important;
   position: static !important;
@@ -19,6 +24,51 @@
   max-width: 100% !important;
   box-sizing: border-box !important;
   word-break: break-word !important;
+}
+
+/* preset 1：左竖线（默认） */
+.trf-tr-block.trf-preset-line {
+  border-left: 2px solid rgba(128, 138, 168, 0.55) !important;
+}
+
+/* preset 2：虚线下划线 */
+.trf-tr-block.trf-preset-underline {
+  border-left: 0 !important;
+  padding-left: 0 !important;
+  padding-bottom: 1px !important;
+  border-bottom: 1px dashed rgba(200, 169, 106, 0.55) !important;
+  font-style: normal !important;
+  opacity: 0.92 !important;
+}
+
+/* preset 3：卡片 */
+.trf-tr-block.trf-preset-card {
+  border-left: 0 !important;
+  padding: 6px 10px !important;
+  background: rgba(200, 169, 106, 0.1) !important;
+  border-radius: 6px !important;
+  font-style: normal !important;
+  opacity: 1 !important;
+}
+
+/* flex(row)/grid 父容器：译文放进整行容器，避免与原文排成横向项 */
+.trf-tr-wrap {
+  display: block !important;
+  flex: 0 0 100% !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  grid-column: 1 / -1 !important;
+  align-self: stretch !important;
+  box-sizing: border-box !important;
+}
+
+/* 悬停显示模式：译文默认收起，鼠标悬停原文段落时展开 */
+html.trf-page-hover .trf-tr-block {
+  display: none !important;
+}
+html.trf-page-hover .trf-src:hover > .trf-tr-block,
+html.trf-page-hover .trf-src:hover .trf-tr-wrap > .trf-tr-block {
+  display: block !important;
 }
 
 /* 整页翻译：仅译文模式下被隐藏的原文副本（保留在 DOM 中以便随时还原） */

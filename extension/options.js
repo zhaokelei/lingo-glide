@@ -14,6 +14,7 @@ const DEFAULTS = {
   debugFill: false,
   selectionEnabled: true,
   pageMode: 'dual',
+  stylePreset: 'line',
   batchChars: 800,
   batchParagraphs: 6,
   concurrency: 1,

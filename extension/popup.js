@@ -65,6 +65,8 @@ function getSettings() {
       floatButton: true,
       targetLang: 'zh-Hans',
       sourceLang: 'auto',
+      pageMode: 'dual',
+      stylePreset: 'line',
       autoPromptEnPage: true,
       shortcutTranslateEnabled: true,
       inputShortcut: 'Ctrl+Shift+Enter'
@@ -232,6 +234,8 @@ function applySettings(s) {
   $('swAutoPrompt').checked = s.autoPromptEnPage !== false;
   $('sourceLang').value = s.sourceLang || 'auto';
   $('target').value = s.targetLang || 'zh-Hans';
+  $('pageMode').value = s.pageMode || 'dual';
+  $('stylePreset').value = s.stylePreset || 'line';
   renderShortcutHint(s);
 }
 
@@ -359,6 +363,14 @@ async function init() {
   $('swSelection').addEventListener('change', (e) => setSync({ selectionEnabled: e.target.checked }));
   $('swBall').addEventListener('change', (e) => setSync({ floatButton: e.target.checked }));
   $('swAutoPrompt').addEventListener('change', (e) => setSync({ autoPromptEnPage: e.target.checked }));
+  $('pageMode').addEventListener('change', (e) => {
+    setSync({ pageMode: e.target.value });
+    tip('显示模式已切换；仅译文与其它模式互切时会还原页面');
+  });
+  $('stylePreset').addEventListener('change', (e) => {
+    setSync({ stylePreset: e.target.value });
+    tip('译文样式已切换，当前页面立即生效');
+  });
 
   $('swSiteOff').addEventListener('change', async (e) => {
     const r = await tabMsg({ type: 'set-site-pref', patch: { disabled: e.target.checked } });

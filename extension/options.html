@@ -169,7 +169,17 @@
         <select id="pageMode">
           <option value="dual">双语对照（译文在原文下方）</option>
           <option value="target">仅译文（保留可还原的原文）</option>
+          <option value="hover">悬停显示（译文默认收起，悬停原文展开）</option>
         </select>
+      </label>
+      <label class="field">
+        <span>译文样式</span>
+        <select id="stylePreset">
+          <option value="line">左竖线</option>
+          <option value="underline">虚线下划线</option>
+          <option value="card">卡片</option>
+        </select>
+        <em>字体、字号、行高、字距自动继承原文</em>
       </label>
       <label class="field small">
         <span>并发数</span>

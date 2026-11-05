@@ -20,6 +20,7 @@
     inputShortcut: 'Ctrl+Shift+Enter',
     selectionEnabled: true,
     pageMode: 'dual',
+    stylePreset: 'line',
     batchChars: 800,
     batchParagraphs: 6,
     concurrency: 1,
@@ -96,20 +97,54 @@
       inflightIds: new Set(),
       observer: null,
       scanTimer: 0,
-      hideTimer: 0
+      hideTimer: 0,
+      scanning: false,
+      rescan: false,
+      deferred: [],
+      idleHandle: 0,
+      io: null,
+      prevPageMode: ''
     }
-  };
-
-  const DEFAULT_BLOCK_STYLE = {
-    display: 'block', margin: '0.45em 0 0 0', padding: '0 0 0 0.62em',
-    borderLeft: '2px solid rgba(128,138,168,.55)', fontStyle: 'italic',
-    opacity: '0.86', fontSize: '0.95em', lineHeight: '1.6', whiteSpace: 'pre-wrap',
-    textIndent: '0', color: 'inherit'
   };
 
   /* ---------------- 基础工具 ---------------- */
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const NEAR_MARGIN_PX = 800;      // 视口上下各 800px 视为“邻近”，优先预取
+  const SCAN_NODE_BATCH = 140;     // 每批处理的文本节点数，处理完让出主线程
+  const IDLE_PROMOTE_BATCH = 4;    // 空闲补扫每轮最多提升的段落数
+  const IDLE_START_DELAY = 1500;   // 可见区/邻近处理稳定后再启动空闲补扫
+
+  function yieldToMain() {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      try {
+        if (typeof requestIdleCallback === 'function') {
+          const t = setTimeout(done, 60);
+          requestIdleCallback(() => { clearTimeout(t); done(); }, { timeout: 60 });
+          return;
+        }
+      } catch (e) { /* ignore */ }
+      setTimeout(done, 0);
+    });
+  }
+
+  /** 元素与视口的邻近程度：返回 { near, dist }，dist 为到视口的像素距离 */
+  function viewportNear(el) {
+    let rect;
+    try { rect = el.getBoundingClientRect(); } catch (e) { return { near: true, dist: 0 }; }
+    const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+    let dist = 0;
+    if (rect.bottom < 0) dist = -rect.bottom;
+    else if (rect.top > vh) dist = rect.top - vh;
+    return { near: dist <= NEAR_MARGIN_PX, dist };
+  }
 
   function loadSettings() {
     try {
@@ -126,7 +161,32 @@
     if (!state.settings.tripleSpaceEnabled) spaceSeq.length = 0;
     updateFloatButton();
     updateCard();
+    applyPagePresentation();
     if (state.settings.autoPromptEnPage) scheduleAutoPrompt();
+  }
+
+  /** 显示模式 / 样式预设变化后，对已渲染的译文实时生效；涉及“仅译文”时还原重译 */
+  function applyPagePresentation() {
+    const mode = state.settings.pageMode === 'hover' ? 'hover'
+      : state.settings.pageMode === 'target' ? 'target' : 'dual';
+    const prev = state.page.prevPageMode;
+    state.page.prevPageMode = mode;
+    document.documentElement.classList.toggle('trf-page-hover', mode === 'hover');
+    if (!state.page.hasTranslations) return;
+    const preset = presetName();
+    document.querySelectorAll('[data-trf="tr"]').forEach((el) => {
+      el.classList.remove('trf-preset-line', 'trf-preset-underline', 'trf-preset-card');
+      el.classList.add(`trf-preset-${preset}`);
+    });
+    if (prev && prev !== mode && (prev === 'target' || mode === 'target')) {
+      restorePage({ silent: true });
+      ui.toast('显示模式已切换，已还原原文，请重新翻译', { duration: 2400 });
+    }
+  }
+
+  function presetName() {
+    const p = state.settings.stylePreset;
+    return p === 'underline' || p === 'card' ? p : 'line';
   }
 
   function updateFloatButton() {
@@ -265,7 +325,7 @@
       <div class="lc-go-row"><button class="lc-more">更多⌄</button><button class="lc-go">翻译</button></div>
       <div class="lc-warn"></div>
       <div class="lc-morebox">
-        <div class="lc-seg"><button data-mode="dual">双语对照</button><button data-mode="target">仅译文</button></div>
+        <div class="lc-seg"><button data-mode="dual">双语</button><button data-mode="target">仅译文</button><button data-mode="hover">悬停</button></div>
         <button class="lc-toggle">翻译整页</button>
         <label class="lc-chk"><input type="checkbox" class="lc-never"><span>此网站不再提示</span></label>
         <label class="lc-chk"><input type="checkbox" class="lc-always"><span>总是翻译这个网站</span></label>
@@ -656,10 +716,14 @@
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
     .toast.err { border-color: rgba(220,120,100,.55); color: #ffd9cf; }
     .toast.ok { border-color: rgba(120,190,150,.45); }
+    .sel-mark { position: fixed; left: 0; top: 0; width: 0; height: 0; pointer-events: none; z-index: 2; }
+    .sel-line { position: fixed; height: 2px; background: rgba(200,169,106,.72); border-radius: 1px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.35); pointer-events: none; }
     .icon { position: fixed; width: 30px; height: 30px; border-radius: 50%; display: flex;
       align-items: center; justify-content: center; background: rgba(20,21,24,.97);
       border: 1px solid rgba(200,169,106,.75); color: #e2cd97; font-size: 14px; cursor: pointer;
-      box-shadow: 0 6px 20px rgba(0,0,0,.45); user-select: none; transition: transform .12s, background .12s; }
+      box-shadow: 0 6px 20px rgba(0,0,0,.45); user-select: none; pointer-events: auto;
+      transition: transform .12s, background .12s; }
     .icon:hover { transform: scale(1.08); background: #26272c; }
     .bubble { position: fixed; background: rgba(20,21,24,.985); border: 1px solid rgba(200,169,106,.32);
       border-radius: 12px; color: #ece9e2; box-shadow: 0 18px 52px rgba(0,0,0,.62); overflow: hidden;
@@ -1827,6 +1891,32 @@
     });
   }
 
+  /** 把选区矩形按“行”合并：同一行的多个 rect 取并集，跨行返回多组 */
+  function selectionLines() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return [];
+    let rects = [];
+    try { rects = Array.from(sel.getRangeAt(sel.rangeCount - 1).getClientRects()); } catch (e) { return []; }
+    const out = [];
+    for (const r of rects) {
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+      const last = out[out.length - 1];
+      const mid = (r.top + r.bottom) / 2;
+      const lastMid = last ? (last.top + last.bottom) / 2 : -1;
+      const sameLine = last && Math.abs(mid - lastMid) <= Math.max(3, Math.min(r.height, last.bottom - last.top) * 0.55);
+      if (sameLine) {
+        last.left = Math.min(last.left, r.left);
+        last.right = Math.max(last.right, r.right);
+        last.top = Math.min(last.top, r.top);
+        last.bottom = Math.max(last.bottom, r.bottom);
+        continue;
+      }
+      out.push({ left: r.left, right: r.right, top: r.top, bottom: r.bottom });
+    }
+    // 过滤换行符产生的窄条，至少 6px 才算有效内容
+    return out.filter((x) => x.right - x.left >= 6);
+  }
+
   /** 取选区当前在视口中的位置（Range 会跟随文档滚动，即使选区已被浏览器清掉） */
   function currentSelectionRect() {
     const range = state.selection && state.selection.range;
@@ -1855,23 +1945,38 @@
   }
 
   function placementRect() {
-    const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0) return null;
-    const range = sel.getRangeAt(sel.rangeCount - 1);
-    const rects = range.getClientRects();
-    if (!rects.length) return null;
-    const last = rects[rects.length - 1];
-    if (!last || last.width <= 0) return null;
-    return { left: last.left, right: last.right, top: last.top, bottom: last.bottom };
+    const lines = selectionLines();
+    return lines.length ? lines[lines.length - 1] : null;
   }
 
-  function showSelectionIcon(text, rect) {
+  function showSelectionIcon(text, rectArg) {
     hideSelectionIcon();
+    const lines = selectionLines();
+    const rect = rectArg || (lines.length ? lines[lines.length - 1] : null);
+    if (!rect) return;
     const r = ui.ensure();
-    iconEl = document.createElement('div');
-    iconEl.className = 'icon';
-    iconEl.textContent = '译';
-    iconEl.title = '翻译选中内容';
+    const holder = document.createElement('div');
+    holder.className = 'sel-mark';
+    iconEl = holder;
+
+    // 多行选区：每一行下方画一条细线；单行只出圆点
+    if (lines.length > 1) {
+      const vh = window.innerHeight;
+      for (const ln of lines.slice(0, 40)) {
+        if (ln.bottom < 0 || ln.top > vh) continue;
+        const bar = document.createElement('i');
+        bar.className = 'sel-line';
+        bar.style.left = `${Math.max(0, ln.left)}px`;
+        bar.style.top = `${Math.max(0, ln.bottom - 1)}px`;
+        bar.style.width = `${Math.max(6, ln.right - ln.left)}px`;
+        holder.appendChild(bar);
+      }
+    }
+
+    const btn = document.createElement('div');
+    btn.className = 'icon';
+    btn.textContent = '译';
+    btn.title = '翻译选中内容';
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     let left = rect.right + 8;
@@ -1882,17 +1987,18 @@
     // 选区在视口外（如程序化选中）时，把图标钳制回可视区域
     left = Math.min(Math.max(6, left), vw - 36);
     top = Math.min(Math.max(6, top), vh - 36);
-    iconEl.style.left = `${left}px`;
-    iconEl.style.top = `${top}px`;
-    iconEl.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); }, true);
-    iconEl.addEventListener('click', (e) => {
+    btn.style.left = `${left}px`;
+    btn.style.top = `${top}px`;
+    btn.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); }, true);
+    btn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       state.lastIconClickAt = performance.now();
       hideSelectionIcon();
       openBubble(text);
     });
-    r.appendChild(iconEl);
+    holder.appendChild(btn);
+    r.appendChild(holder);
 
     // 记录选区的 Range 副本，供气泡滚动跟随时重新定位
     let range = null;
@@ -1900,7 +2006,7 @@
       const sel = window.getSelection();
       if (sel && sel.rangeCount) range = sel.getRangeAt(sel.rangeCount - 1).cloneRange();
     } catch (e) { /* ignore */ }
-    state.selection = { text, rect, range, lastRect: rect };
+    state.selection = { text, rect, lines, range, lastRect: rect };
   }
 
   function openBubble(text) {
@@ -2116,6 +2222,8 @@
   const BLOCK_TAGS = new Set(['P', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TD', 'TH', 'DD', 'DT',
     'BLOCKQUOTE', 'FIGCAPTION', 'DIV', 'UL', 'OL', 'DL', 'ARTICLE', 'SECTION', 'ASIDE', 'HEADER',
     'FOOTER', 'MAIN', 'NAV', 'FORM', 'LABEL', 'TR', 'CAPTION']);
+  const INLINE_TAGS = new Set(['SPAN', 'A', 'B', 'I', 'EM', 'STRONG', 'SMALL', 'LABEL', 'TIME',
+    'ABBR', 'CITE', 'Q', 'MARK', 'BDI', 'BDO', 'SUB', 'SUP']);
 
   function findBlock(el) {
     let cur = el;
@@ -2124,6 +2232,15 @@
       if (cur === document.body || cur === document.documentElement) return null;
       const tag = cur.tagName;
       if (BLOCK_TAGS.has(tag)) return cur;
+      // flex/grid 子项会被浏览器块化；行内语义标签提升到容器，避免一句话被拆成多个段落
+      if (INLINE_TAGS.has(tag)) {
+        const parent = cur.parentElement;
+        if (parent && parent !== document.body && parent.children.length <= 6) {
+          let pd = '';
+          try { pd = getComputedStyle(parent).display; } catch (e) { pd = ''; }
+          if (pd === 'flex' || pd === 'inline-flex' || pd === 'grid' || pd === 'inline-grid') return parent;
+        }
+      }
       let display = '';
       try { display = getComputedStyle(cur).display; } catch (e) { display = ''; }
       if (display && !['inline', 'contents', 'inline-block', 'inline-flex', 'inline-grid', 'table-row-group'].includes(display)) return cur;
@@ -2152,13 +2269,10 @@
     return false;
   }
 
-  /** 收集本页可翻译段落，返回 [{el, text}]，并打上 data-trf=pending 防止重复 */
-  function collectParagraphs(root) {
-    const records = [];
-    if (!root || !document.body) return records;
+  /** 创建分段扫描器：以“块”为单位累积文本，保证同一段不会被批边界切断 */
+  function createScanner(root) {
     const blockCache = new Map();
     const blockedCache = new Map();
-
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const parent = node.parentElement;
@@ -2173,42 +2287,237 @@
       }
     });
 
-    const map = new Map();
-    let node;
-    while ((node = walker.nextNode())) {
-      const parent = node.parentElement;
-      let block = blockCache.get(parent);
-      if (block === undefined) {
-        block = findBlock(parent);
-        blockCache.set(parent, block);
-      }
-      if (!block || block.hasAttribute('data-trf')) continue;
-      if (!isVisible(block)) continue;
-      let rec = map.get(block);
-      if (!rec) { rec = { el: block, text: '' }; map.set(block, rec); }
-      const raw = node.nodeValue;
-      if (rec.text && /[A-Za-z0-9]$/.test(rec.text) && /^[A-Za-z0-9]/.test(raw)) rec.text += ' ';
-      rec.text += raw;
+    let currentBlock = null;
+    let currentText = '';
+    let currentSkip = false;
+    let exhausted = false;
+
+    function flush(out) {
+      if (currentBlock && !currentSkip) out.push({ el: currentBlock, text: currentText });
+      currentBlock = null;
+      currentText = '';
+      currentSkip = false;
     }
 
-    for (const [el, rec] of map) {
-      const text = rec.text.replace(/\s+/g, ' ').trim();
-      if (!text || looksLikeNoise(text)) continue;
-      if (el.textContent.trim().length === 0) continue;
-      el.setAttribute('data-trf', 'pending');
-      records.push({ el, text });
+    /** 处理最多 budget 个文本节点，返回完整段落 [{el,text}]；不写任何 DOM 标记 */
+    function nextBatch(budget) {
+      const out = [];
+      let node = null;
+      let n = 0;
+      while (n < budget && (node = walker.nextNode())) {
+        n++;
+        const parent = node.parentElement;
+        let block = blockCache.get(parent);
+        if (block === undefined) {
+          block = findBlock(parent);
+          blockCache.set(parent, block);
+        }
+        if (!block) continue;
+        if (block !== currentBlock) {
+          flush(out);
+          currentBlock = block;
+          currentSkip = block.hasAttribute('data-trf') || !isVisible(block);
+        }
+        if (currentSkip) continue;
+        const raw = node.nodeValue;
+        if (currentText && /[A-Za-z0-9]$/.test(currentText) && /^[A-Za-z0-9]/.test(raw)) currentText += ' ';
+        currentText += raw;
+      }
+      if (!node) {
+        flush(out);
+        exhausted = true;
+      }
+      return out.map((rec) => ({ el: rec.el, text: rec.text.replace(/\s+/g, ' ').trim() }))
+        .filter((rec) => rec.text && !looksLikeNoise(rec.text) && rec.el.textContent.trim().length > 0);
     }
-    return records;
+
+    return { nextBatch, isDone: () => exhausted };
   }
 
-  function makeTrSpan(text) {
+  /** 同步采样少量段落，用于语言判定（不写标记、不会污染后续扫描） */
+  function sampleParagraphs(root, maxNodes = 120) {
+    const scanner = createScanner(root);
+    return scanner.nextBatch(maxNodes);
+  }
+
+  /** 视口附近直接入队；远处进 deferred，交给邻近观察与空闲补扫 */
+  function enqueueRecords(records, opts = {}) {
+    const queue = [];
+    const far = [];
+    for (const rec of records) {
+      if (!rec.el.isConnected) continue;
+      const mark = rec.el.getAttribute('data-trf');
+      if (mark && mark !== 'deferred') continue; // 去重：扫描/入队/渲染竞争都以此为准
+      const { near } = viewportNear(rec.el);
+      if (near || opts.all) queue.push(rec);
+      else far.push(rec);
+    }
+    for (const rec of queue) rec.el.setAttribute('data-trf', 'pending');
+    for (const rec of far) {
+      if (state.page.io) {
+        rec.el.setAttribute('data-trf', 'deferred');
+        state.page.deferred.push(rec);
+        try { state.page.io.observe(rec.el); } catch (e) { /* ignore */ }
+      } else {
+        rec.el.setAttribute('data-trf', 'pending');
+        queue.push(rec);
+      }
+    }
+    if (!queue.length && !far.length) return 0;
+    state.page.total += queue.length + far.length;
+    if (queue.length) {
+      state.page.queue.push(...queue);
+      updateStatus();
+      drainQueue();
+    }
+    scheduleIdleScan();
+    return queue.length + far.length;
+  }
+
+  /** 分阶段扫描：每批让出主线程；扫描期间的新变化合并成一次重扫 */
+  async function scanParagraphs(root) {
+    if (!state.page.active || state.page.stopped) return 0;
+    if (state.page.scanning) { state.page.rescan = true; return 0; }
+    state.page.scanning = true;
+    let added = 0;
+    try {
+      const scanner = createScanner(root || document.body);
+      while (!scanner.isDone()) {
+        if (!state.page.active || state.page.stopped) break;
+        const batch = scanner.nextBatch(SCAN_NODE_BATCH);
+        if (batch.length) {
+          added += enqueueRecords(batch);
+          await yieldToMain();
+        } else {
+          await yieldToMain();
+        }
+      }
+    } finally {
+      state.page.scanning = false;
+    }
+    if (state.page.rescan) {
+      state.page.rescan = false;
+      scheduleScan(120);
+    }
+    return added;
+  }
+
+  /** 把远处段落中已接近视口的提升入队（邻近预取：滚动或 IntersectionObserver 触发）
+   * force=true 时空闲补扫忽略视口距离，按顺序消化剩余段落 */
+  function promoteDeferred(limit = Infinity, force = false) {
+    if (!state.page.active || state.page.stopped) return 0;
+    if (!state.page.deferred.length) return 0;
+    const keep = [];
+    const move = [];
+    for (const rec of state.page.deferred) {
+      if (!rec.el.isConnected || rec.el.getAttribute('data-trf') !== 'deferred') continue;
+      if (move.length < limit && (force || viewportNear(rec.el).near)) move.push(rec);
+      else keep.push(rec);
+    }
+    state.page.deferred = keep;
+    if (!move.length) return 0;
+    for (const rec of move) {
+      if (state.page.io) try { state.page.io.unobserve(rec.el); } catch (e) { /* ignore */ }
+      rec.el.setAttribute('data-trf', 'pending');
+    }
+    state.page.queue.unshift(...move);
+    updateStatus();
+    drainQueue();
+    recoverLog('log', `邻近预取 ${move.length} 段（剩余 ${keep.length} 段待空闲补扫）`);
+    return move.length;
+  }
+
+  /** 空闲补扫：可见区/邻近队列空下来后，逐步消化远处段落 */
+  function scheduleIdleScan(delay = IDLE_START_DELAY) {
+    if (state.page.idleHandle || !state.page.active || state.page.stopped) return;
+    if (!state.page.deferred.length) return;
+    const run = () => {
+      state.page.idleHandle = 0;
+      if (!state.page.active || state.page.stopped || !state.page.deferred.length) return;
+      // 可见区与预取队列优先：还有待处理批次时，空闲补扫顺延
+      if (state.page.queue.length || state.page.draining) {
+        state.page.idleHandle = setTimeout(run, 400);
+        return;
+      }
+      promoteDeferred(IDLE_PROMOTE_BATCH, true);
+      if (state.page.deferred.length) scheduleIdleScan(600);
+    };
+    state.page.idleHandle = setTimeout(run, delay);
+  }
+
+  /** 启动邻近观察器：远处段落进入视口前后 800px 时提升入队 */
+  function startNearObserver() {
+    if (state.page.io || typeof IntersectionObserver !== 'function') return;
+    state.page.io = new IntersectionObserver((entries) => {
+      if (!state.page.active || state.page.stopped) return;
+      let hit = false;
+      for (const en of entries) {
+        if (!en.isIntersecting) continue;
+        hit = true;
+        try { state.page.io.unobserve(en.target); } catch (e) { /* ignore */ }
+      }
+      if (hit) promoteDeferred();
+    }, { rootMargin: `${NEAR_MARGIN_PX}px 0px`, threshold: 0 });
+  }
+
+  function stopNearObserver() {
+    if (state.page.io) {
+      try { state.page.io.disconnect(); } catch (e) { /* ignore */ }
+      state.page.io = null;
+    }
+    if (state.page.idleHandle) { clearTimeout(state.page.idleHandle); state.page.idleHandle = 0; }
+    state.page.deferred = [];
+  }
+
+  function makeTrSpan(text, sourceEl) {
     const span = document.createElement('span');
-    span.className = 'trf-tr-block';
+    span.className = `trf-tr-block trf-preset-${presetName()}`;
     span.setAttribute('data-trf', 'tr');
     span.setAttribute('translate', 'no');
     span.textContent = text;
-    span.style.cssText = Object.entries(DEFAULT_BLOCK_STYLE).map(([k, v]) => `${k.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())}:${v}`).join(';');
+    // 排版继承：字体、字号、行高、字距、字重、对齐、方向、颜色
+    if (sourceEl) {
+      try {
+        const cs = getComputedStyle(sourceEl);
+        const vars = {
+          '--trf-font-family': cs.fontFamily,
+          '--trf-font-size': cs.fontSize,
+          '--trf-line-height': cs.lineHeight,
+          '--trf-letter-spacing': cs.letterSpacing,
+          '--trf-font-weight': cs.fontWeight,
+          '--trf-text-align': cs.textAlign,
+          '--trf-direction': cs.direction,
+          '--trf-color': cs.color
+        };
+        for (const [k, v] of Object.entries(vars)) if (v) span.style.setProperty(k, v);
+      } catch (e) { /* ignore */ }
+    }
     return span;
+  }
+
+
+  /** 译文容器：flex/grid 父容器里不能直接 append，否则译文会被排成横向项 */
+  function needsWrap(recEl) {
+    let cs;
+    try { cs = getComputedStyle(recEl); } catch (e) { return false; }
+    const display = cs.display || '';
+    if (display === 'grid' || display === 'inline-grid') return true;
+    if (display === 'flex' || display === 'inline-flex') {
+      return cs.flexDirection === 'row' || cs.flexDirection === 'row-reverse';
+    }
+    return false;
+  }
+
+  function appendTranslation(recEl, span) {
+    if (!needsWrap(recEl)) {
+      recEl.appendChild(span);
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'trf-tr-wrap';
+    wrap.setAttribute('data-trf', 'wrap');
+    wrap.appendChild(span);
+    recEl.appendChild(wrap);
   }
 
   function renderParagraphs(recs, outs, fallback = new Set()) {
@@ -2223,12 +2532,13 @@
         while (rec.el.firstChild) orig.appendChild(rec.el.firstChild);
         rec.el.appendChild(orig);
       }
-      const span = makeTrSpan(txt);
+      const span = makeTrSpan(txt, rec.el);
       if (fallback.has(i)) {
         span.classList.add('trf-fallback');
         span.title = '占位符校验失败，已回落原文';
       }
-      rec.el.appendChild(span);
+      rec.el.classList.add('trf-src');
+      appendTranslation(rec.el, span);
       rec.el.setAttribute('data-trf', fallback.has(i) ? 'fallback' : 'done');
       state.page.hasTranslations = true;
     });
@@ -2414,6 +2724,11 @@
 
     if (state.page.active && !state.page.stopped) {
       if (state.page.queue.length) { drainQueue(); return; }
+      if (state.page.deferred.length) {
+        updateStatus({ note: `可见区已译完，剩余 ${state.page.deferred.length} 段随滚动/空闲继续翻译` });
+        scheduleIdleScan();
+        return;
+      }
       if (state.page.failed) updateStatus();
       else updateStatus({ note: '翻译完成', hideIn: 3000 });
     }
@@ -2424,7 +2739,19 @@
     state.page.active = false;
     for (const id of state.page.inflightIds) callBackground({ type: 'cancel', id });
     state.page.inflightIds.clear();
+    for (const rec of state.page.deferred) {
+      if (rec.el && rec.el.isConnected && rec.el.getAttribute('data-trf') === 'deferred') rec.el.removeAttribute('data-trf');
+    }
+    stopNearObserver();
     updateStatus({ note, error: isError, hideIn: isError ? 0 : 2500 });
+  }
+
+  /** 中止/重新开始时清掉上一轮遗留的未完成标记，避免扫描时被当成“已处理”跳过 */
+  function resetStaleMarks() {
+    document.querySelectorAll('[data-trf="pending"],[data-trf="deferred"],[data-trf="failed"]').forEach((el) => {
+      el.removeAttribute('data-trf');
+      if (el.hasAttribute('title')) el.removeAttribute('title');
+    });
   }
 
   function startPageTranslation(target) {
@@ -2433,14 +2760,13 @@
       ui.toast('扩展在当前网站已禁用，可在面板里重新开启', { type: 'err' });
       return;
     }
-    const recs = collectParagraphs(document.body);
-    if (!recs.length) {
+    const sample = sampleParagraphs(document.body, 120);
+    if (!sample.length) {
       ui.toast('本页没有可翻译的正文', { type: 'err' });
       return;
     }
-    const sample = recs.slice(0, 3).map((r) => r.text).join('\n\n').slice(0, 800);
-    const dir = resolveDirection(sample, target || state.settings.targetLang || 'zh-Hans',
-      state.settings.sourceLang || 'auto');
+    const dir = resolveDirection(sample.slice(0, 3).map((r) => r.text).join('\n\n').slice(0, 800),
+      target || state.settings.targetLang || 'zh-Hans', state.settings.sourceLang || 'auto');
     if (dir.err || !dir) {
       ui.toast('无法识别页面语言', { type: 'err' });
       return;
@@ -2457,14 +2783,19 @@
     state.page.cacheMs = 0;
     state.page.hasTranslations = false;
     state.page.dir = dir;
+    state.page.scanning = false;
+    state.page.rescan = false;
+    state.page.deferred = [];
+    resetStaleMarks();
 
-    state.page.queue.push(...recs);
-    state.page.total = recs.length;
+    applyPagePresentation();
     updateStatus();
     updateBall();
     updateCard();
+    startNearObserver();
     startObserver();
-    drainQueue();
+    // 可见区优先入队，其余交给邻近预取 / 空闲补扫；扫描本身分批让出主线程
+    scanParagraphs(document.body).catch(() => { /* 页面重渲染导致节点失效时静默结束 */ });
   }
 
   function translatePageWithTarget() {
@@ -2484,6 +2815,8 @@
       state.page.observer = null;
     }
     clearTimeout(state.page.scanTimer);
+    stopNearObserver();
+    document.documentElement.classList.remove('trf-page-hover');
 
     // 先还原「仅译文」模式下的原文副本
     document.querySelectorAll('[data-trf="orig"]').forEach((orig) => {
@@ -2492,10 +2825,12 @@
       while (orig.firstChild) parent.insertBefore(orig.firstChild, orig);
       orig.remove();
     });
-    // 再移除译文块
+    // 再移除译文块与 flex/grid 包装容器
     document.querySelectorAll('[data-trf="tr"]').forEach((el) => el.remove());
-    // 最后清掉标记
+    document.querySelectorAll('[data-trf="wrap"]').forEach((el) => el.remove());
+    // 最后清掉标记与样式类
     document.querySelectorAll('[data-trf]').forEach((el) => el.removeAttribute('data-trf'));
+    document.querySelectorAll('.trf-src').forEach((el) => el.classList.remove('trf-src'));
 
     state.page.hasTranslations = false;
     state.page.total = 0;
@@ -2504,6 +2839,8 @@
     state.page.failedRecs = [];
     state.page.cached = 0;
     state.page.cacheMs = 0;
+    state.page.scanning = false;
+    state.page.rescan = false;
     const bar = ui.ensure().querySelector('.stat');
     if (bar) bar.remove();
     updateBall();
@@ -2524,33 +2861,39 @@
     else translatePageWithTarget();
   }
 
+  /** MutationObserver 的增量扫描入口：交给 scanParagraphs，由其合并并发扫描 */
   function scanAndQueue() {
     if (!state.page.active || state.page.stopped) return;
-    const recs = collectParagraphs(document.body);
-    if (!recs.length) return;
-    state.page.queue.push(...recs);
-    state.page.total += recs.length;
-    updateStatus();
-    drainQueue();
+    scanParagraphs(document.body).catch(() => { /* ignore */ });
+  }
+
+  function scheduleScan(delay = 300) {
+    clearTimeout(state.page.scanTimer);
+    state.page.scanTimer = setTimeout(scanAndQueue, delay);
   }
 
   function startObserver() {
     if (state.page.observer) return;
-    state.page.observer = new MutationObserver(() => {
+    state.page.observer = new MutationObserver((muts) => {
       if (!state.page.active || state.page.stopped) return;
-      clearTimeout(state.page.scanTimer);
-      state.page.scanTimer = setTimeout(scanAndQueue, 300); // 节流 300ms
+      // 过滤掉本扩展自己插入/移除的节点，避免译文渲染自激重扫
+      let relevant = false;
+      for (const m of muts) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType === 1 && (node.hasAttribute('data-trf') || (node.closest && node.closest('[data-trf]')))) continue;
+          relevant = true; break;
+        }
+        if (relevant) break;
+        for (const node of m.removedNodes) {
+          if (node.nodeType === 1 && node.hasAttribute('data-trf')) continue;
+          relevant = true; break;
+        }
+        if (relevant) break;
+      }
+      if (!relevant) return;
+      scheduleScan(300); // 节流 300ms；扫描中的变更由 scanParagraphs 合并重扫
     });
     state.page.observer.observe(document.body, { childList: true, subtree: true });
-  }
-
-  function togglePage() {
-    if (domainIgnored()) {
-      ui.toast('当前域名在忽略列表中，未执行翻译', { type: 'err' });
-      return;
-    }
-    if (state.page.active || state.page.hasTranslations) restorePage();
-    else startPageTranslation();
   }
 
   /* ---------------- 后台消息 ---------------- */
