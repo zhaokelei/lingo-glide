@@ -11,7 +11,7 @@
     <div class="logo">译</div>
     <div class="hero-text">
       <h1>本地翻译 <span>hy-mt2</span></h1>
-      <p>对接本机 llama.cpp 服务 · 纯本地推理 · 无账号 · 内容不出机器</p>
+      <p>对接本机 llama.cpp 或任意 OpenAI 兼容服务 · 默认纯本地 · 无账号</p>
     </div>
     <div class="save-dot" id="saveDot">已保存</div>
   </header>
@@ -20,14 +20,23 @@
     <h2>服务连接</h2>
     <div class="grid">
       <label class="field">
-        <span>服务地址</span>
-        <input id="endpoint" type="text" spellcheck="false" placeholder="http://127.0.0.1:8080/v1">
-        <em>OpenAI 兼容接口根地址，末尾带 /v1</em>
+        <span>服务地址（base_url）</span>
+        <input id="endpoint" type="text" spellcheck="false" placeholder="http://127.0.0.1:8080">
+        <em>OpenAI 兼容接口根地址，带不带 /v1 都行；只接受 http/https</em>
+      </label>
+      <label class="field">
+        <span>API Key</span>
+        <div class="key-wrap">
+          <input id="apiKey" type="password" spellcheck="false" autocomplete="off" placeholder="本地服务可留空">
+          <span id="apiKeyMask" class="key-mask" hidden></span>
+          <button id="toggleKey" type="button" class="btn tiny">显示</button>
+        </div>
+        <em id="apiKeyHint">留空则不发 Authorization；只存本机 chrome.storage.local，不进 Chrome 同步</em>
       </label>
       <label class="field">
         <span>模型名</span>
         <input id="model" type="text" spellcheck="false" placeholder="hy-mt2">
-        <em>llama.cpp 加载的模型标识</em>
+        <em>llama.cpp 的 --alias，或远端服务返回的模型 ID</em>
       </label>
       <label class="field small">
         <span>温度</span>
@@ -42,6 +51,7 @@
     </div>
     <div class="row">
       <button id="testBtn" class="btn primary">连接测试</button>
+      <button id="clearKeyBtn" class="btn">清除 Key</button>
       <span id="testResult" class="result">未测试</span>
     </div>
   </section>
@@ -215,13 +225,13 @@
     </label>
     <div class="row">
       <button id="resetBtn" class="btn">恢复默认设置</button>
-      <span class="result muted">所有设置会自动保存到 chrome.storage.sync</span>
+      <span class="result muted">普通设置存 chrome.storage.sync，API Key 只存本机 chrome.storage.local</span>
     </div>
   </section>
 
   <footer class="foot">
-    <p>本地服务未启动？双击桌面上的 <b>启动翻译模型.command</b>，等终端出现 <code>server listening</code> 后刷新页面。</p>
-    <p class="muted">本扩展只访问 127.0.0.1 上的服务，不会上传任何内容到外网。</p>
+    <p>默认只连本机服务。填写第三方地址后，你触发翻译的文本会发往该地址，请自行确认对方的隐私条款。</p>
+    <p class="muted">扩展不内置任何第三方服务地址，也不经过开发者服务器。</p>
   </footer>
 </div>
 <script src="options.js"></script>

@@ -27,6 +27,7 @@ const DEFAULTS = {
 };
 
 const DISCONNECTED_HINT = '本地翻译服务未连接，请先双击桌面『启动翻译模型.command』';
+const CORS_HINT = '服务未允许来自扩展的跨域请求';
 
 const SYSTEM_PROMPT = [
   '你是专业翻译引擎，严格遵守以下规则：',
@@ -51,16 +52,26 @@ const TARGET_NAMES = {
 const PROMPT_VERSION = 'p2';
 
 let settings = { ...DEFAULTS };
+/* API Key 只存 chrome.storage.local：sync 会同步到用户自己的 Google 账号，密钥不该走那里 */
+let apiKey = '';
 const settingsReady = (async () => {
   try {
-    const got = await chrome.storage.sync.get(DEFAULTS);
+    const [got, local] = await Promise.all([
+      chrome.storage.sync.get(DEFAULTS),
+      chrome.storage.local.get({ apiKey: '' })
+    ]);
     settings = { ...DEFAULTS, ...got };
+    apiKey = String(local.apiKey || '').trim();
   } catch (e) {
     // 扩展刚安装时可能还不可用，使用默认值即可
   }
 })();
 
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.apiKey) {
+    apiKey = String(changes.apiKey.newValue || '').trim();
+    return;
+  }
   if (area !== 'sync') return;
   for (const key of Object.keys(changes)) {
     if (changes[key].newValue !== undefined) settings[key] = changes[key].newValue;
@@ -101,8 +112,44 @@ function enqueue(fn) {
 
 const inflight = new Map();
 
+/** 归一化服务地址：去掉末尾斜杠与 /v1，拼接时统一补 /v1，避免出现 /v1/v1/ */
+function normalizeBase(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return { url: '', error: '服务地址不能为空' };
+  let u;
+  try {
+    u = new URL(s);
+  } catch (e) {
+    return { url: '', error: '服务地址不是合法 URL' };
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return { url: '', error: '只支持 http 或 https 地址' };
+  if (!u.hostname) return { url: '', error: '服务地址缺少主机名' };
+  const url = s.replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '');
+  return { url, error: '' };
+}
+
 function baseUrl() {
-  return String(settings.endpoint || DEFAULTS.endpoint).trim().replace(/\/+$/, '');
+  return normalizeBase(settings.endpoint).url || 'http://127.0.0.1:8080';
+}
+
+function apiUrl(path) {
+  return `${baseUrl()}/v1${path}`;
+}
+
+function isLocalEndpoint() {
+  try {
+    const host = new URL(baseUrl()).hostname;
+    return ['127.0.0.1', 'localhost', '::1', '0.0.0.0'].includes(host);
+  } catch (e) {
+    return true;
+  }
+}
+
+/** 有 Key 才带 Authorization；本地 llama.cpp 无 Key 时保持原样 */
+function authHeaders(extra) {
+  const headers = { ...(extra || {}) };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  return headers;
 }
 
 function buildInstruction(to, src, count) {
@@ -173,15 +220,18 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
       messages: buildMessages({ text, count, to, src })
     };
 
-    const res = await fetch(`${baseUrl()}/chat/completions`, {
+    const res = await fetch(apiUrl('/chat/completions'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
       signal: ctrl.signal,
       cache: 'no-store'
     });
 
     if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        throw new RequestError('auth', 'API Key 无效或未授权');
+      }
       let detail = '';
       try {
         detail = (await res.text()).slice(0, 200);
@@ -255,7 +305,10 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
     if (e instanceof RequestError) {
       return { ok: false, code: e.code, error: e.message };
     }
-    // fetch 网络层失败：最常见的场景就是本机服务没启动
+    // fetch 网络层失败：本机多半是服务没启动，远端多半是被跨域拦下或地址不可达
+    if (!isLocalEndpoint()) {
+      return { ok: false, code: 'cors', error: CORS_HINT };
+    }
     return { ok: false, code: 'disconnected', error: DISCONNECTED_HINT };
   } finally {
     clearTimeout(timer);
@@ -508,20 +561,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function testConnection() {
+  const norm = normalizeBase(settings.endpoint);
+  if (norm.error) return { ok: false, code: 'config', error: norm.error, endpoint: String(settings.endpoint || '') };
   const timeoutMs = 5000;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`${baseUrl()}/models`, { signal: ctrl.signal, cache: 'no-store' });
-    if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, endpoint: baseUrl() };
+    const res = await fetch(apiUrl('/models'), {
+      signal: ctrl.signal,
+      cache: 'no-store',
+      headers: authHeaders()
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, code: 'auth', error: 'API Key 无效或未授权', endpoint: baseUrl() };
+    }
+    if (!res.ok) return { ok: false, code: 'http', error: `HTTP ${res.status}`, endpoint: baseUrl() };
     const json = await res.json();
     const list = (json && (json.data || json.models)) || [];
     const ids = list.map((m) => m.id || m.name).filter(Boolean);
     const hasModel = ids.length === 0 || ids.includes(settings.model);
-    return { ok: true, models: ids, endpoint: baseUrl(), model: settings.model, hasModel };
+    return {
+      ok: true, models: ids, endpoint: baseUrl(), model: settings.model, hasModel,
+      remote: !isLocalEndpoint(), hasKey: !!apiKey
+    };
   } catch (e) {
-    if (e && e.name === 'AbortError') return { ok: false, error: '连接超时（5s）', endpoint: baseUrl() };
-    return { ok: false, error: DISCONNECTED_HINT, endpoint: baseUrl() };
+    if (e && e.name === 'AbortError') return { ok: false, code: 'timeout', error: '连接超时（5s）', endpoint: baseUrl() };
+    if (!isLocalEndpoint()) return { ok: false, code: 'cors', error: CORS_HINT, endpoint: baseUrl() };
+    return { ok: false, code: 'disconnected', error: DISCONNECTED_HINT, endpoint: baseUrl() };
   } finally {
     clearTimeout(timer);
   }

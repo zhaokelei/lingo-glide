@@ -2,7 +2,7 @@
 'use strict';
 
 const DEFAULTS = {
-  endpoint: 'http://127.0.0.1:8080/v1',
+  endpoint: 'http://127.0.0.1:8080',
   model: 'hy-mt2',
   temperature: 0.3,
   timeoutSec: 60,
@@ -24,6 +24,28 @@ const DEFAULTS = {
   autoPromptEnPage: true,
   followSourceLang: false,
   cacheTTL: 30
+};
+
+/* 保存前校验：URL 只收 http/https 且必须有主机名；模型名不能为空；key 只去首尾空白 */
+const VALIDATORS = {
+  endpoint(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    if (!s) return { ok: false, error: '服务地址不能为空' };
+    let u;
+    try {
+      u = new URL(s);
+    } catch (e) {
+      return { ok: false, error: '服务地址不是合法 URL' };
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return { ok: false, error: '只支持 http 或 https 地址' };
+    if (!u.hostname) return { ok: false, error: '服务地址缺少主机名' };
+    return { ok: true, value: s };
+  },
+  model(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    if (!s) return { ok: false, error: '模型名不能为空' };
+    return { ok: true, value: s };
+  }
 };
 
 const FIELDS = Object.keys(DEFAULTS);
@@ -64,9 +86,111 @@ function load() {
   });
 }
 
+/* ---------------- API Key：只存 chrome.storage.local，界面只露末 4 位 ---------------- */
+
+const keyInput = document.getElementById('apiKey');
+const keyMask = document.getElementById('apiKeyMask');
+const toggleKeyBtn = document.getElementById('toggleKey');
+let apiKeyRaw = '';
+let keyRevealed = false;
+
+function maskKey(k) {
+  if (!k) return '';
+  return k.length <= 4 ? '••••' : '••••' + k.slice(-4);
+}
+
+function renderKey() {
+  const has = !!apiKeyRaw;
+  if (!has) {
+    keyRevealed = false;
+    keyInput.style.display = '';
+    keyInput.type = 'password';
+    keyInput.value = '';
+    keyMask.hidden = true;
+    toggleKeyBtn.textContent = '显示';
+    return;
+  }
+  if (keyRevealed) {
+    keyInput.style.display = '';
+    keyInput.type = 'text';
+    keyInput.value = apiKeyRaw;
+    keyMask.hidden = true;
+    toggleKeyBtn.textContent = '隐藏';
+    return;
+  }
+  keyInput.style.display = 'none';
+  keyMask.textContent = maskKey(apiKeyRaw);
+  keyMask.hidden = false;
+  toggleKeyBtn.textContent = '显示';
+}
+
+function saveKey(raw) {
+  const clean = String(raw == null ? '' : raw).trim();
+  apiKeyRaw = clean;
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ apiKey: clean }, () => {
+      if (chrome.runtime.lastError) {
+        testResult.textContent = `保存失败：${chrome.runtime.lastError.message}`;
+        testResult.className = 'result err';
+        resolve(false);
+        return;
+      }
+      flashSaved();
+      resolve(true);
+    });
+  });
+}
+
+keyInput.addEventListener('change', () => { saveKey(keyInput.value).then(renderKey); });
+keyInput.addEventListener('blur', () => { if (!keyRevealed) renderKey(); });
+
+keyMask.addEventListener('click', () => {
+  keyInput.style.display = '';
+  keyMask.hidden = true;
+  keyInput.type = 'password';
+  keyInput.focus();
+  keyInput.setSelectionRange(keyInput.value.length, keyInput.value.length);
+});
+
+toggleKeyBtn.addEventListener('click', () => {
+  if (keyInput.style.display !== 'none') apiKeyRaw = keyInput.value.trim();
+  if (!apiKeyRaw) {
+    testResult.textContent = '当前没有 Key，直接输入即可';
+    testResult.className = 'result muted';
+    return;
+  }
+  keyRevealed = !keyRevealed;
+  renderKey();
+});
+
+document.getElementById('clearKeyBtn').addEventListener('click', () => {
+  chrome.storage.local.remove('apiKey', () => {
+    apiKeyRaw = '';
+    keyRevealed = false;
+    renderKey();
+    testResult.textContent = '已清除本机存储的 API Key';
+    testResult.className = 'result ok';
+  });
+});
+
+chrome.storage.local.get({ apiKey: '' }, (got) => {
+  apiKeyRaw = String(got.apiKey || '').trim();
+  renderKey();
+});
+
 function saveOne(key) {
-  const value = readControl(key);
+  let value = readControl(key);
   if (value === undefined) return;
+  const v = VALIDATORS[key];
+  if (v) {
+    const r = v(value);
+    if (!r.ok) {
+      testResult.textContent = r.error;
+      testResult.className = 'result err';
+      return;
+    }
+    value = r.value;
+  }
   chrome.storage.sync.set({ [key]: value }, () => {
     if (chrome.runtime.lastError) {
       testResult.textContent = `保存失败：${chrome.runtime.lastError.message}`;
@@ -80,6 +204,11 @@ function saveOne(key) {
 FIELDS.forEach((key) => {
   const el = document.getElementById(key);
   if (!el) return;
+  // 地址与模型名需要校验，只在提交时保存，避免输入过程中反复报错
+  if (VALIDATORS[key]) {
+    el.addEventListener('change', () => saveOne(key));
+    return;
+  }
   const evt = el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input';
   el.addEventListener(evt, () => saveOne(key));
   if (evt === 'input') el.addEventListener('change', () => saveOne(key));
@@ -267,10 +396,14 @@ document.getElementById('testBtn').addEventListener('click', () => {
     }
     if (res.ok) {
       const models = (res.models || []).join('、') || '未返回模型列表';
+      const head = res.remote ? `已连接 · 远程 · ${res.model}` : `已连接 · ${res.model}`;
       testResult.textContent = res.hasModel
-        ? `已连接 · ${res.endpoint} · 模型 ${res.model}`
+        ? `${head}（${res.endpoint}）`
         : `已连接，但服务里没有模型「${res.model}」（现有：${models}）`;
       testResult.className = res.hasModel ? 'result ok' : 'result err';
+    } else if (res.code === 'auth') {
+      testResult.textContent = 'API Key 无效或未授权';
+      testResult.className = 'result err';
     } else {
       testResult.textContent = `连接失败：${res.error}`;
       testResult.className = 'result err';
@@ -281,8 +414,12 @@ document.getElementById('testBtn').addEventListener('click', () => {
 document.getElementById('resetBtn').addEventListener('click', () => {
   chrome.storage.sync.set(DEFAULTS, () => {
     FIELDS.forEach((k) => writeControl(k, DEFAULTS[k]));
+    chrome.storage.local.remove('apiKey', () => {
+      apiKeyRaw = '';
+      renderKey();
+    });
     flashSaved();
-    testResult.textContent = '已恢复默认设置';
+    testResult.textContent = '已恢复默认设置（API Key 已清除）';
     testResult.className = 'result ok';
   });
 });

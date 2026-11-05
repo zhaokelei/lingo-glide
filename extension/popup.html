@@ -17,6 +17,32 @@
       <button class="mini" id="retest">重测</button>
     </div>
 
+    <details class="svc" id="svcBox">
+      <summary>服务设置 <span class="svc-sum" id="svcSum">127.0.0.1:8080 · hy-mt2</span></summary>
+      <div class="svc-body">
+        <label class="svc-field">
+          <span>服务地址（base_url）</span>
+          <input id="pEndpoint" type="text" spellcheck="false" placeholder="http://127.0.0.1:8080">
+        </label>
+        <label class="svc-field">
+          <span>API Key</span>
+          <div class="key-row">
+            <input id="pApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="本地服务可留空">
+            <span id="pKeyMask" class="key-mask" hidden></span>
+            <button id="pToggleKey" type="button" class="mini">显示</button>
+          </div>
+        </label>
+        <label class="svc-field">
+          <span>模型名</span>
+          <input id="pModel" type="text" spellcheck="false" placeholder="hy-mt2">
+        </label>
+        <div class="svc-foot">
+          <button id="pClearKey" type="button" class="mini">清除 Key</button>
+          <span id="pSaveHint" class="svc-hint">Key 只存本机</span>
+        </div>
+      </div>
+    </details>
+
     <div class="langbar">
       <div class="lang-src">
         <div class="lang-label">源语言</div>

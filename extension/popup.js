@@ -76,6 +76,115 @@ function setSync(patch) {
   return new Promise((resolve) => chrome.storage.sync.set(patch, resolve));
 }
 
+/* ---------------- 服务设置：服务地址 / API Key / 模型名 ---------------- */
+
+function maskKey(k) {
+  if (!k) return '';
+  return k.length <= 4 ? '••••' : '••••' + k.slice(-4);
+}
+
+let pKeyRaw = '';
+let pKeyRevealed = false;
+const pKeyInput = $('pApiKey');
+const pKeyMask = $('pKeyMask');
+
+function updateSvcSum() {
+  const ep = ($('pEndpoint').value || '').trim().replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/^https?:\/\//, '');
+  const model = ($('pModel').value || '').trim();
+  $('svcSum').textContent = `${ep || '—'} · ${model || '—'}`;
+}
+
+function renderPKey() {
+  if (!pKeyRaw) {
+    pKeyRevealed = false;
+    pKeyInput.style.display = '';
+    pKeyInput.type = 'password';
+    pKeyInput.value = '';
+    pKeyMask.hidden = true;
+    $('pToggleKey').textContent = '显示';
+    return;
+  }
+  if (pKeyRevealed) {
+    pKeyInput.style.display = '';
+    pKeyInput.type = 'text';
+    pKeyInput.value = pKeyRaw;
+    pKeyMask.hidden = true;
+    $('pToggleKey').textContent = '隐藏';
+    return;
+  }
+  pKeyInput.style.display = 'none';
+  pKeyMask.textContent = maskKey(pKeyRaw);
+  pKeyMask.hidden = false;
+  $('pToggleKey').textContent = '显示';
+}
+
+function loadConnFields() {
+  chrome.storage.sync.get({ endpoint: 'http://127.0.0.1:8080', model: 'hy-mt2' }, (s) => {
+    $('pEndpoint').value = s.endpoint || 'http://127.0.0.1:8080';
+    $('pModel').value = s.model || 'hy-mt2';
+    updateSvcSum();
+    chrome.storage.local.get({ apiKey: '' }, (l) => {
+      pKeyRaw = String(l.apiKey || '').trim();
+      renderPKey();
+    });
+  });
+}
+
+function saveConn() {
+  const endpoint = $('pEndpoint').value.trim();
+  const model = $('pModel').value.trim();
+  const hint = $('pSaveHint');
+  let err = '';
+  try {
+    const u = new URL(endpoint);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') err = '只支持 http/https 地址';
+    else if (!u.hostname) err = '地址缺少主机名';
+  } catch (e) {
+    err = endpoint ? '地址不是合法 URL' : '服务地址不能为空';
+  }
+  if (!err && !model) err = '模型名不能为空';
+  if (err) {
+    hint.textContent = err;
+    hint.style.color = 'var(--err)';
+    return;
+  }
+  chrome.storage.sync.set({ endpoint, model }, () => {
+    hint.textContent = '已保存';
+    hint.style.color = 'var(--gold)';
+    updateSvcSum();
+    refreshStatus();
+    setTimeout(() => { hint.textContent = 'Key 只存本机'; hint.style.color = ''; }, 2000);
+  });
+}
+
+pKeyInput.addEventListener('change', () => {
+  pKeyRaw = pKeyInput.value.trim();
+  chrome.storage.local.set({ apiKey: pKeyRaw }, renderPKey);
+});
+pKeyInput.addEventListener('blur', () => { if (!pKeyRevealed) renderPKey(); });
+pKeyMask.addEventListener('click', () => {
+  pKeyInput.style.display = '';
+  pKeyMask.hidden = true;
+  pKeyInput.type = 'password';
+  pKeyInput.focus();
+  pKeyInput.setSelectionRange(pKeyInput.value.length, pKeyInput.value.length);
+});
+$('pToggleKey').addEventListener('click', () => {
+  if (pKeyInput.style.display !== 'none') pKeyRaw = pKeyInput.value.trim();
+  if (!pKeyRaw) return;
+  pKeyRevealed = !pKeyRevealed;
+  renderPKey();
+});
+$('pClearKey').addEventListener('click', () => {
+  chrome.storage.local.remove('apiKey', () => {
+    pKeyRaw = '';
+    pKeyRevealed = false;
+    renderPKey();
+    tip('已清除本机存储的 Key');
+    refreshStatus();
+  });
+});
+
 function fillLangs() {
   const src = $('sourceLang');
   for (const t of SOURCE_LANGS) {
@@ -107,12 +216,12 @@ async function refreshStatus() {
   const sub = $('statusSub');
   if (r && r.ok) {
     dot.className = 'dot ok';
-    main.textContent = `已连接${r.model ? ' · ' + r.model : ''}`;
+    main.textContent = r.remote ? `已连接 · 远程 · ${r.model}` : `已连接${r.model ? ' · ' + r.model : ''}`;
     sub.textContent = r.endpoint || '';
   } else {
     dot.className = 'dot err';
     main.textContent = '未连接';
-    sub.textContent = (r && (r.endpoint || r.error)) || '本地服务未启动';
+    sub.textContent = (r && (r.error || r.endpoint)) || '本地服务未启动';
   }
 }
 
@@ -216,6 +325,7 @@ async function init() {
 
   const s = await getSettings();
   applySettings(s);
+  loadConnFields();
 
   await refreshState();
   refreshStatus();
@@ -274,6 +384,9 @@ async function init() {
   });
 
   $('openOptions').addEventListener('click', () => chrome.runtime.openOptionsPage());
+
+  $('pEndpoint').addEventListener('change', saveConn);
+  $('pModel').addEventListener('change', saveConn);
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'sync') return;

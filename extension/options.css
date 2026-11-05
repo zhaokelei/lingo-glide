@@ -150,6 +150,37 @@ html, body {
   color: var(--muted);
 }
 
+/* API Key：输入框是 password 类型；收起时只露末 4 位 */
+.key-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.key-wrap input { flex: 1; min-width: 0; }
+
+.key-mask {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-2);
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  cursor: text;
+  user-select: none;
+}
+
+.key-mask[hidden] { display: none; }
+
+.btn.tiny {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  font-size: 11.5px;
+}
+
 .hint {
   display: block;
   font-style: normal;
@@ -161,6 +192,7 @@ html, body {
 
 input[type="text"],
 input[type="number"],
+input[type="password"],
 select,
 textarea {
   width: 100%;
