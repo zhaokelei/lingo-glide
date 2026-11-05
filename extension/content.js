@@ -8,6 +8,14 @@
   window.__trfLoaded = true;
   document.documentElement.setAttribute('data-trf-ext', '1');
 
+  // 阶段三：all_frames 下每个 frame 都有独立实例；跨源 iframe 不启用，避免越权与重复翻译
+  const IS_SUBFRAME = window.top !== window.self;
+  if (IS_SUBFRAME) {
+    let sameOrigin = true;
+    try { void window.top.location.href; } catch (e) { sameOrigin = false; }
+    if (!sameOrigin) return;
+  }
+
   const DEFAULTS = {
     endpoint: 'http://127.0.0.1:8080/v1',
     model: 'hy-mt2',
@@ -103,7 +111,9 @@
       deferred: [],
       idleHandle: 0,
       io: null,
-      prevPageMode: ''
+      prevPageMode: '',
+      shadowRoots: [],
+      frameToken: ''
     }
   };
 
@@ -172,11 +182,14 @@
     const prev = state.page.prevPageMode;
     state.page.prevPageMode = mode;
     document.documentElement.classList.toggle('trf-page-hover', mode === 'hover');
+    syncShadowHover(mode === 'hover');
     if (!state.page.hasTranslations) return;
     const preset = presetName();
-    document.querySelectorAll('[data-trf="tr"]').forEach((el) => {
-      el.classList.remove('trf-preset-line', 'trf-preset-underline', 'trf-preset-card');
-      el.classList.add(`trf-preset-${preset}`);
+    eachRoot((root) => {
+      root.querySelectorAll('[data-trf="tr"]').forEach((el) => {
+        el.classList.remove('trf-preset-line', 'trf-preset-underline', 'trf-preset-card');
+        el.classList.add(`trf-preset-${preset}`);
+      });
     });
     if (prev && prev !== mode && (prev === 'target' || mode === 'target')) {
       restorePage({ silent: true });
@@ -202,6 +215,8 @@
   function hostKey() { return (location.hostname || '').toLowerCase(); }
 
   function ballEnabled() {
+    // 子 frame 不显示悬浮球：整页翻译由顶层 frame 通过 postMessage 广播触发
+    if (IS_SUBFRAME) return false;
     return !!state.settings.floatButton && !state.site.disabled && !domainIgnored();
   }
 
@@ -841,6 +856,51 @@
       font-weight: 600; padding: 6px 12px; border-radius: 7px; cursor: pointer; }
     .pc-copy:hover { filter: brightness(1.06); }
     .pc-ok { font-size: 11px; color: #8fd0a4; }
+  `;
+
+  /* 影子根内没有页面样式表，译文块样式需要单独注入一份精简副本；
+   * 悬停模式改用 host 属性驱动（html 选择器无法跨 shadow 边界） */
+  const SHADOW_PAGE_CSS = `
+    .trf-tr-block {
+      display: block !important; margin: .45em 0 0 0 !important; padding: 0 0 0 .62em !important;
+      border-left: 2px solid rgba(128,138,168,.55) !important;
+      font-family: var(--trf-font-family, inherit) !important;
+      font-size: var(--trf-font-size, .95em) !important;
+      font-weight: var(--trf-font-weight, inherit) !important;
+      line-height: var(--trf-line-height, 1.6) !important;
+      letter-spacing: var(--trf-letter-spacing, normal) !important;
+      text-align: var(--trf-text-align, left) !important;
+      direction: var(--trf-direction, inherit) !important;
+      color: var(--trf-color, inherit) !important;
+      font-style: italic !important; opacity: .86 !important; text-indent: 0 !important;
+      text-transform: none !important; white-space: pre-wrap !important; float: none !important;
+      position: static !important; transform: none !important; max-width: 100% !important;
+      box-sizing: border-box !important; word-break: break-word !important;
+    }
+    .trf-tr-block.trf-preset-underline {
+      border-left: 0 !important; padding-left: 0 !important; padding-bottom: 1px !important;
+      border-bottom: 1px dashed rgba(200,169,106,.55) !important;
+      font-style: normal !important; opacity: .92 !important;
+    }
+    .trf-tr-block.trf-preset-card {
+      border-left: 0 !important; padding: 6px 10px !important;
+      background: rgba(200,169,106,.1) !important; border-radius: 6px !important;
+      font-style: normal !important; opacity: 1 !important;
+    }
+    .trf-tr-wrap {
+      display: block !important; flex: 0 0 100% !important; width: 100% !important;
+      min-width: 0 !important; grid-column: 1 / -1 !important; align-self: stretch !important;
+      box-sizing: border-box !important;
+    }
+    :host([data-trf-hover]) .trf-tr-block { display: none !important; }
+    :host([data-trf-hover]) .trf-src:hover > .trf-tr-block,
+    :host([data-trf-hover]) .trf-src:hover .trf-tr-wrap > .trf-tr-block { display: block !important; }
+    .trf-orig-hidden { display: none !important; }
+    .trf-tr-block.trf-fallback {
+      font-style: normal !important; opacity: .55 !important;
+      border-left-color: rgba(200,169,106,.45) !important;
+    }
+    [data-trf="failed"] { box-shadow: inset 0 -1px 0 rgba(220,110,90,.55) !important; }
   `;
 
   const ui = (() => {
@@ -2269,6 +2329,83 @@
     return false;
   }
 
+  /** 取元素影子根：优先 open shadowRoot，其次 chrome.dom.openOrClosedShadowRoot（closed） */
+  function shadowRootOf(el) {
+    if (!el || el.nodeType !== 1) return null;
+    if (el.shadowRoot) return el.shadowRoot;
+    try {
+      if (chrome.dom && typeof chrome.dom.openOrClosedShadowRoot === 'function') {
+        return chrome.dom.openOrClosedShadowRoot(el) || null;
+      }
+    } catch (e) { /* 该元素不支持或 API 不可用 */ }
+    return null;
+  }
+
+  /** 影子根内没有页面 CSS，需要注入一份译文样式；已注入过则跳过 */
+  function injectShadowStyles(sr) {
+    if (!sr) return;
+    try {
+      if (sr.querySelector && sr.querySelector('style[data-trf-style]')) return;
+      const style = document.createElement('style');
+      style.setAttribute('data-trf-style', '1');
+      style.textContent = SHADOW_PAGE_CSS;
+      sr.appendChild(style);
+    } catch (e) { /* 影子根已销毁或不允许写入 */ }
+  }
+
+  function registerShadowRoot(sr) {
+    if (!sr || state.page.shadowRoots.includes(sr)) return false;
+    state.page.shadowRoots.push(sr);
+    injectShadowStyles(sr);
+    if (sr.host && state.settings.pageMode === 'hover') sr.host.setAttribute('data-trf-hover', '1');
+    observeRoot(sr);
+    return true;
+  }
+
+  /** 悬停显示模式：影子根内的译文由 host 属性控制显隐 */
+  function syncShadowHover(on) {
+    for (const sr of state.page.shadowRoots) {
+      if (!sr || !sr.host || !sr.host.isConnected) continue;
+      try {
+        if (on) sr.host.setAttribute('data-trf-hover', '1');
+        else sr.host.removeAttribute('data-trf-hover');
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  /** 依次在 document 与所有影子根上执行回调（还原/清理用） */
+  function eachRoot(fn) {
+    try { fn(document); } catch (e) { /* ignore */ }
+    for (const sr of state.page.shadowRoots) {
+      if (!sr || !sr.host || !sr.host.isConnected) continue;
+      try { fn(sr); } catch (e) { /* 影子根可能已被组件销毁 */ }
+    }
+  }
+
+  /** 异步收集文档内所有 shadow root（含 closed 与嵌套），每 200 个元素让出主线程 */
+  async function collectShadowRoots() {
+    if (!document.body) return;
+    const pending = [document.body];
+    let n = 0;
+    while (pending.length) {
+      const scope = pending.shift();
+      if (!scope) continue;
+      const walker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT, {
+        acceptNode(el) {
+          if (el.matches(SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      let node = null;
+      while ((node = walker.nextNode())) {
+        if (!state.page.active || state.page.stopped) return;
+        const sr = shadowRootOf(node);
+        if (sr && registerShadowRoot(sr)) pending.push(sr);
+        if (++n % 200 === 0) await yieldToMain();
+      }
+    }
+  }
+
   /** 创建分段扫描器：以“块”为单位累积文本，保证同一段不会被批边界切断 */
   function createScanner(root) {
     const blockCache = new Map();
@@ -2316,6 +2453,12 @@
         if (block !== currentBlock) {
           flush(out);
           currentBlock = block;
+          // 组件重渲染可能把已插入的译文节点吞掉：标记还在但没有译文块时视为未翻译
+          const mark = block.getAttribute('data-trf');
+          if ((mark === 'done' || mark === 'fallback') && !block.querySelector('[data-trf="tr"]')) {
+            block.removeAttribute('data-trf');
+            if (block.hasAttribute('title')) block.removeAttribute('title');
+          }
           currentSkip = block.hasAttribute('data-trf') || !isVisible(block);
         }
         if (currentSkip) continue;
@@ -2374,23 +2517,49 @@
     return queue.length + far.length;
   }
 
-  /** 分阶段扫描：每批让出主线程；扫描期间的新变化合并成一次重扫 */
+  /** 扫描单个根（document.body 或影子根）：每批让出主线程 */
+  async function scanRoot(root) {
+    let added = 0;
+    const scanner = createScanner(root);
+    while (!scanner.isDone()) {
+      if (!state.page.active || state.page.stopped) break;
+      const batch = scanner.nextBatch(SCAN_NODE_BATCH);
+      if (batch.length) added += enqueueRecords(batch);
+      await yieldToMain();
+    }
+    return added;
+  }
+
+  /** 分阶段扫描单个根：扫描期间的新变化合并成一次重扫 */
   async function scanParagraphs(root) {
     if (!state.page.active || state.page.stopped) return 0;
     if (state.page.scanning) { state.page.rescan = true; return 0; }
     state.page.scanning = true;
     let added = 0;
     try {
-      const scanner = createScanner(root || document.body);
-      while (!scanner.isDone()) {
+      added = await scanRoot(root || document.body);
+    } finally {
+      state.page.scanning = false;
+    }
+    if (state.page.rescan) {
+      state.page.rescan = false;
+      scheduleScan(120);
+    }
+    return added;
+  }
+
+  /** 扫描 document 与所有影子根（含 closed），同一根只扫一遍 */
+  async function scanAllRoots() {
+    if (!state.page.active || state.page.stopped) return 0;
+    if (state.page.scanning) { state.page.rescan = true; return 0; }
+    state.page.scanning = true;
+    let added = 0;
+    try {
+      await collectShadowRoots();
+      const roots = [document.body, ...state.page.shadowRoots.slice()];
+      for (const root of roots) {
         if (!state.page.active || state.page.stopped) break;
-        const batch = scanner.nextBatch(SCAN_NODE_BATCH);
-        if (batch.length) {
-          added += enqueueRecords(batch);
-          await yieldToMain();
-        } else {
-          await yieldToMain();
-        }
+        added += await scanRoot(root);
       }
     } finally {
       state.page.scanning = false;
@@ -2509,6 +2678,13 @@
   }
 
   function appendTranslation(recEl, span) {
+    // 表格行不能直接挂译文 span（HTML 内容模型不允许），放进该行最后一个单元格
+    if (recEl.tagName === 'TR') {
+      const cells = recEl.querySelectorAll('td,th');
+      const cell = cells[cells.length - 1];
+      (cell || recEl).appendChild(span);
+      return;
+    }
     if (!needsWrap(recEl)) {
       recEl.appendChild(span);
       return;
@@ -2586,6 +2762,8 @@
   }
 
   function updateStatus(extra = {}) {
+    // 子 frame 不显示状态栏：避免多个 iframe 各挂一条，进度统一由顶层 frame 呈现
+    if (IS_SUBFRAME) return;
     const bar = statusBar();
     clearTimeout(state.page.hideTimer);
     bar.classList.remove('hide');
@@ -2748,24 +2926,48 @@
 
   /** 中止/重新开始时清掉上一轮遗留的未完成标记，避免扫描时被当成“已处理”跳过 */
   function resetStaleMarks() {
-    document.querySelectorAll('[data-trf="pending"],[data-trf="deferred"],[data-trf="failed"]').forEach((el) => {
-      el.removeAttribute('data-trf');
-      if (el.hasAttribute('title')) el.removeAttribute('title');
+    eachRoot((root) => {
+      root.querySelectorAll('[data-trf="pending"],[data-trf="deferred"],[data-trf="failed"]').forEach((el) => {
+        el.removeAttribute('data-trf');
+        if (el.hasAttribute('title')) el.removeAttribute('title');
+      });
     });
   }
 
-  function startPageTranslation(target) {
+  /** 顶层/同源父 frame 向同源子 iframe 广播翻译动作；token 用于子 frame 去重 */
+  function frameBroadcast(action, extra) {
+    const passed = extra && extra.token;
+    const token = passed || (action === 'start'
+      ? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      : (state.page.frameToken || `${Date.now()}-${Math.random().toString(36).slice(2)}`));
+    if (action === 'start') state.page.frameToken = token;
+    for (const f of document.querySelectorAll('iframe')) {
+      let win = null;
+      try {
+        void f.contentDocument; // 跨源会抛错，直接跳过
+        win = f.contentWindow;
+      } catch (e) { continue; }
+      if (!win) continue;
+      try { win.postMessage({ __trfFrame: 1, action, token, ...(extra || {}) }, '*'); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function startPageTranslation(target, frameToken) {
     if (state.page.active) return;
     if (state.site.disabled || domainIgnored()) {
       ui.toast('扩展在当前网站已禁用，可在面板里重新开启', { type: 'err' });
       return;
     }
     const sample = sampleParagraphs(document.body, 120);
-    if (!sample.length) {
+    // 正文可能全部在 Shadow DOM：document 采样为空时用 body 文本/标题兜底，仍尝试扫描影子根
+    const sampleText = sample.length
+      ? sample.slice(0, 3).map((r) => r.text).join('\n\n').slice(0, 800)
+      : ((document.body && document.body.innerText) || document.title || '').slice(0, 800);
+    if (!sampleText.trim()) {
       ui.toast('本页没有可翻译的正文', { type: 'err' });
       return;
     }
-    const dir = resolveDirection(sample.slice(0, 3).map((r) => r.text).join('\n\n').slice(0, 800),
+    const dir = resolveDirection(sampleText,
       target || state.settings.targetLang || 'zh-Hans', state.settings.sourceLang || 'auto');
     if (dir.err || !dir) {
       ui.toast('无法识别页面语言', { type: 'err' });
@@ -2786,6 +2988,7 @@
     state.page.scanning = false;
     state.page.rescan = false;
     state.page.deferred = [];
+    state.page.frameToken = frameToken || '';
     resetStaleMarks();
 
     applyPagePresentation();
@@ -2794,8 +2997,9 @@
     updateCard();
     startNearObserver();
     startObserver();
+    frameBroadcast('start', { token: state.page.frameToken || undefined, target: target || state.settings.targetLang });
     // 可见区优先入队，其余交给邻近预取 / 空闲补扫；扫描本身分批让出主线程
-    scanParagraphs(document.body).catch(() => { /* 页面重渲染导致节点失效时静默结束 */ });
+    scanAllRoots().catch(() => { /* 页面重渲染导致节点失效时静默结束 */ });
   }
 
   function translatePageWithTarget() {
@@ -2819,18 +3023,35 @@
     document.documentElement.classList.remove('trf-page-hover');
 
     // 先还原「仅译文」模式下的原文副本
-    document.querySelectorAll('[data-trf="orig"]').forEach((orig) => {
-      const parent = orig.parentElement;
-      if (!parent) { orig.remove(); return; }
-      while (orig.firstChild) parent.insertBefore(orig.firstChild, orig);
-      orig.remove();
+    eachRoot((root) => {
+      root.querySelectorAll('[data-trf="orig"]').forEach((orig) => {
+        const parent = orig.parentElement;
+        if (!parent) { orig.remove(); return; }
+        while (orig.firstChild) parent.insertBefore(orig.firstChild, orig);
+        orig.remove();
+      });
     });
     // 再移除译文块与 flex/grid 包装容器
-    document.querySelectorAll('[data-trf="tr"]').forEach((el) => el.remove());
-    document.querySelectorAll('[data-trf="wrap"]').forEach((el) => el.remove());
+    eachRoot((root) => {
+      root.querySelectorAll('[data-trf="tr"]').forEach((el) => el.remove());
+      root.querySelectorAll('[data-trf="wrap"]').forEach((el) => el.remove());
+    });
     // 最后清掉标记与样式类
-    document.querySelectorAll('[data-trf]').forEach((el) => el.removeAttribute('data-trf'));
-    document.querySelectorAll('.trf-src').forEach((el) => el.classList.remove('trf-src'));
+    eachRoot((root) => {
+      root.querySelectorAll('[data-trf]').forEach((el) => el.removeAttribute('data-trf'));
+      root.querySelectorAll('.trf-src').forEach((el) => el.classList.remove('trf-src'));
+    });
+    // 清掉注入到影子根的样式与悬停属性，避免组件后续渲染受影响
+    for (const sr of state.page.shadowRoots) {
+      try {
+        if (sr.host) sr.host.removeAttribute('data-trf-hover');
+        const st = sr.querySelector && sr.querySelector('style[data-trf-style]');
+        if (st) st.remove();
+      } catch (e) { /* ignore */ }
+      try { if (state.page.observer) state.page.observer.unobserve(sr); } catch (e) { /* ignore */ }
+    }
+    // 清空登记表：下次翻译重新收集，并重新注入影子根样式
+    state.page.shadowRoots = [];
 
     state.page.hasTranslations = false;
     state.page.total = 0;
@@ -2845,6 +3066,7 @@
     if (bar) bar.remove();
     updateBall();
     updateCard();
+    frameBroadcast('restore', { token: state.page.frameToken || undefined });
     if (!opts.silent) ui.toast('已还原原文', { duration: 1600 });
   }
 
@@ -2861,15 +3083,21 @@
     else translatePageWithTarget();
   }
 
-  /** MutationObserver 的增量扫描入口：交给 scanParagraphs，由其合并并发扫描 */
+  /** MutationObserver 的增量扫描入口：交给 scanAllRoots，由其合并并发扫描 */
   function scanAndQueue() {
     if (!state.page.active || state.page.stopped) return;
-    scanParagraphs(document.body).catch(() => { /* ignore */ });
+    scanAllRoots().catch(() => { /* ignore */ });
   }
 
   function scheduleScan(delay = 300) {
     clearTimeout(state.page.scanTimer);
     state.page.scanTimer = setTimeout(scanAndQueue, delay);
+  }
+
+  /** 对影子根挂同一个观察器：组件重渲染清空内容后能重新扫描补译 */
+  function observeRoot(root) {
+    if (!root || !state.page.observer) return;
+    try { state.page.observer.observe(root, { childList: true, subtree: true }); } catch (e) { /* ignore */ }
   }
 
   function startObserver() {
@@ -2891,9 +3119,10 @@
         if (relevant) break;
       }
       if (!relevant) return;
-      scheduleScan(300); // 节流 300ms；扫描中的变更由 scanParagraphs 合并重扫
+      scheduleScan(300); // 节流 300ms；扫描中的变更由扫描器合并重扫
     });
     state.page.observer.observe(document.body, { childList: true, subtree: true });
+    for (const sr of state.page.shadowRoots) observeRoot(sr);
   }
 
   /* ---------------- 后台消息 ---------------- */
@@ -2950,6 +3179,23 @@
       return false;
     });
   } catch (e) { /* ignore */ }
+
+  // 子 frame 只接受父 frame 的广播动作，token 相同则忽略，避免重复翻译
+  if (IS_SUBFRAME) {
+    window.addEventListener('message', (e) => {
+      if (e.source !== window.parent) return;
+      const d = e.data;
+      if (!d || d.__trfFrame !== 1) return;
+      if (d.action === 'start') {
+        if (d.token && state.page.frameToken === d.token) return;
+        if (state.page.active || state.page.hasTranslations) return;
+        startPageTranslation(d.target, d.token);
+      } else if (d.action === 'restore') {
+        state.page.frameToken = d.token || state.page.frameToken;
+        if (state.page.active || state.page.hasTranslations) restorePage({ silent: true });
+      }
+    }, false);
+  }
 
   loadSettings();
   loadSitePrefsAndBall();
