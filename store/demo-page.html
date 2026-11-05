@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Machine translation</title>
+<style>
+  :root { --ink: #1f2328; --muted: #54595f; --rule: #d5d8dc; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #fff; color: var(--ink);
+    font: 17px/1.75 Georgia, "Times New Roman", serif;
+    padding: 56px 0 80px;
+  }
+  .page { max-width: 940px; margin: 0 auto; padding: 0 40px; }
+  .kicker { font: 12px/1 -apple-system, "Helvetica Neue", sans-serif; letter-spacing: .14em; text-transform: uppercase; color: #8b6f3f; }
+  h1 { font-size: 40px; line-height: 1.15; font-weight: 400; margin: 12px 0 6px; letter-spacing: -.01em; }
+  .byline { font: 13px/1.4 -apple-system, sans-serif; color: var(--muted); border-bottom: 1px solid var(--rule); padding-bottom: 18px; margin-bottom: 26px; }
+  .lede { font-size: 19px; color: #2c3138; }
+  h2 { font-size: 24px; font-weight: 400; margin: 38px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); }
+  p { margin: 0 0 18px; }
+  p + p { text-indent: 0; }
+  .quote { border-left: 3px solid #c8a96a; padding: 2px 0 2px 18px; margin: 26px 0; color: #3a4046; font-style: italic; }
+  .foot { margin-top: 46px; padding-top: 16px; border-top: 1px solid var(--rule); font: 12px/1.6 -apple-system, sans-serif; color: #7b8087; }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Machine translation</h1>
+
+  <p class="lede">Machine translation is the use of computer systems to convert text or speech from one natural language into another without human involvement in the wording of the output.</p>
+
+  <h2>History</h2>
+  <p>Early proposals in the 1950s treated translation as a code-breaking problem and relied on bilingual dictionaries plus a small set of hand-written reordering rules.</p>
+  <p>Rule-based systems dominated until the 1980s, when statistical methods began to estimate translation probabilities directly from large collections of parallel text.</p>
+  <p>Neural models arrived in the middle of the 2010s and quickly replaced most statistical pipelines, because a single network could learn word order, agreement and idiom together.</p>
+
+  <h2>Approaches</h2>
+  <p>Statistical systems break a sentence into phrases, score each candidate phrase pair against a parallel corpus, and then search for the combination with the highest total score.</p>
+  <p>Smaller models that run on a single machine trade a little fluency for privacy and latency, and they are now practical for reading tasks on ordinary laptops.</p>
+
+  <h2>Quality</h2>
+  <p>Automatic metrics compare machine output with one or more human references and reward overlap in words and word sequences, which makes them fast but blunt.</p>
+  <p>Human evaluation remains the only reliable way to judge whether a translation reads naturally, keeps the original meaning and handles names, numbers and units correctly.</p>
+
+  <h2>Use in everyday reading</h2>
+  <p>Readers who follow foreign news, documentation or forum threads often need a rough translation immediately, and they accept a few awkward phrases in exchange for speed.</p>
+  <p>Keeping the original text next to the translation helps in that situation, because the reader can check a name, a figure or a quoted sentence against the source.</p>
+  <p>Local models change the trade-off: the text never leaves the machine, so a reader can translate a private document or an internal ticket without hesitation.</p>
+
+  <h2>See also</h2>
+  <p>Related topics include computer-assisted translation, speech recognition, terminology management and the evaluation of generated text.</p>
+
+  <div class="foot">This page is a demonstration document used to photograph the extension. It is not a real encyclopedia article.</div>
+</div>
+</body>
+</html>

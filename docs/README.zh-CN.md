@@ -4,6 +4,8 @@
 
 浏览器里直接翻译：输入框、划词、整页。译文由本机 llama.cpp 起服务生成，不经过任何云端，不需要账号和密钥。
 
+隐私说明：[PRIVACY.md](../PRIVACY.md#中文)（English 在上半部分）
+
 要求 Chrome / Edge 111 及以上。开发与实测环境是 macOS + Edge 155 + Hy-MT2-1.8B Q4_K_M（纯 CPU）。
 
 ## 三个入口

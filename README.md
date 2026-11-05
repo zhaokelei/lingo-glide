@@ -2,6 +2,8 @@
 
 A browser extension (Chrome / Edge, Manifest V3) that translates in the page using a local llama.cpp server. No cloud API, no account, no key.
 
+Privacy policy: [PRIVACY.md](PRIVACY.md) · 隐私说明：[PRIVACY.md](PRIVACY.md#中文)
+
 Tested on macOS with Edge 155 and `Hy-MT2-1.8B-Q4_K_M.gguf` on CPU. Chrome 111 or newer is required (`world: "MAIN"` content script).
 
 ## Features
