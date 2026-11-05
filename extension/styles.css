@@ -25,3 +25,15 @@
 .trf-orig-hidden {
   display: none !important;
 }
+
+/* 占位符校验失败后回落原文的译文块：降对比度并标注意外 */
+.trf-tr-block.trf-fallback {
+  font-style: normal !important;
+  opacity: 0.55 !important;
+  border-left-color: rgba(200, 169, 106, 0.45) !important;
+}
+
+/* 翻译未完成（可补译）的段落：底部虚线提示，不改变布局高度 */
+[data-trf="failed"] {
+  box-shadow: inset 0 -1px 0 rgba(220, 110, 90, 0.55) !important;
+}

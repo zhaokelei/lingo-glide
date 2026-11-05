@@ -86,6 +86,7 @@
       draining: false,
       hasTranslations: false,
       queue: [],
+      failedRecs: [],
       total: 0,
       done: 0,
       failed: 0,
@@ -690,6 +691,10 @@
     .stat .btn { background: transparent; border: 1px solid rgba(255,255,255,.18); color: #ddd; font-size: 11px;
       padding: 3px 9px; border-radius: 5px; cursor: pointer; }
     .stat .btn:hover { border-color: rgba(200,169,106,.65); color: #f0e4c0; }
+    .stat .retry { background: rgba(200,169,106,.14); border: 1px solid rgba(200,169,106,.55);
+      color: #f0e4c0; font-size: 11px; padding: 3px 9px; border-radius: 5px; cursor: pointer; }
+    .stat .retry:hover { background: rgba(200,169,106,.24); }
+    .stat .retry[hidden] { display: none; }
     .stat .bar { margin-top: 8px; height: 3px; border-radius: 2px; background: rgba(255,255,255,.09); overflow: hidden; }
     .stat .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg,#a8874e,#d3b479);
       transition: width .3s ease; }
@@ -913,39 +918,6 @@
     return byBlank.length ? byBlank : byLine.length ? byLine : [raw];
   }
 
-  /** 模型返回段数与请求不一致时的兜底：按最短相邻合并 / 最长句子切分，绝不丢段 */
-  function forceAlign(parts, n) {
-    let p = parts.map((s) => String(s).trim()).filter(Boolean);
-    if (!p.length) return null;
-    if (p.length === n) return p;
-
-    while (p.length > n) {
-      let bi = 0;
-      let best = Infinity;
-      for (let i = 0; i < p.length - 1; i++) {
-        const len = p[i].length + p[i + 1].length;
-        if (len < best) { best = len; bi = i; }
-      }
-      p.splice(bi, 2, `${p[bi].replace(/\s+$/, '')} ${p[bi + 1].replace(/^\s+/, '')}`);
-    }
-
-    while (p.length < n) {
-      let li = 0;
-      for (let i = 1; i < p.length; i++) if (p[i].length > p[li].length) li = i;
-      const s = p[li];
-      let cut = -1;
-      const mid = Math.floor(s.length / 2);
-      const marks = [];
-      for (let i = 0; i < s.length; i++) if ('。！？；.!?;\n'.includes(s[i])) marks.push(i + 1);
-      if (marks.length) {
-        cut = marks.reduce((a, b) => (Math.abs(b - mid) < Math.abs(a - mid) ? b : a), marks[0]);
-      }
-      if (cut <= 0 || cut >= s.length) return null;
-      p.splice(li, 1, s.slice(0, cut).trim(), s.slice(cut).trim());
-    }
-    return p;
-  }
-
   /* ---------------- 批量请求 ---------------- */
 
   function throwIfStopped() {
@@ -956,9 +928,87 @@
     }
   }
 
+  const RECOVER_BISECT_CODES = new Set(['mismatch', 'empty', 'protected', 'timeout']);
+
+  function recoverLog(level, msg) {
+    try { (console[level] || console.log)('[trf/recover]', msg); } catch (e) { /* ignore */ }
+  }
+
+  function trfError(code, message, extra) {
+    const e = new Error(message || code);
+    e.code = code;
+    if (extra) Object.assign(e, extra);
+    return e;
+  }
+
+  /** 发一次请求，严格校验段数与空段；失败抛 mismatch/empty/protected/timeout… */
+  async function rawTranslate(texts, dir, opts = {}) {
+    const m = texts.length;
+    const text = texts.join('\n\n');
+    throwIfStopped();
+    const id = `trf-${++state.seq}-${Math.random().toString(36).slice(2, 7)}`;
+    state.page.inflightIds.add(id);
+    let res;
+    try {
+      res = await callBackground({
+        type: 'translate', id, text, count: m, to: dir.to, src: dir.srcCode,
+        stream: true,
+        // 批量时关闭流式推送：二分后多路增量会互相覆盖气泡内容
+        push: !!opts.push && m === 1
+      });
+    } finally {
+      state.page.inflightIds.delete(id);
+    }
+    if (!res || !res.ok) throw trfError((res && res.code) || 'fail', (res && res.error) || '翻译失败');
+    const parts = splitParagraphs(res.text, m);
+    if (parts.length !== m) {
+      throw trfError('mismatch', `译文段数与原文不一致（${parts.length}/${m}）`, { parts });
+    }
+    if (parts.some((p) => !String(p || '').trim())) throw trfError('empty', '译文存在空段', { parts });
+    return parts;
+  }
+
   /**
-   * 批量翻译：先按段查缓存（命中段不发请求），未命中段合批请求并写回缓存。
-   * 返回 { parts, cached, cacheMs }。
+   * 三级降级：整批 → 递归二分到单段 → 单段重试一次。
+   * 单段最终失败：占位符校验类错误回落原文；其余返回 null，由页面标成「未完成」。
+   * 返回 { parts: (string|null)[], fallback: number[] }。
+   */
+  async function translateWithRecovery(texts, dir, opts = {}) {
+    try {
+      const parts = await rawTranslate(texts, dir, opts);
+      return { parts, fallback: [] };
+    } catch (e) {
+      if (e.code === 'aborted' || e.code === 'disconnected') throw e;
+      if (texts.length > 1) {
+        if (!RECOVER_BISECT_CODES.has(e.code)) throw e;
+        const mid = Math.ceil(texts.length / 2);
+        recoverLog('warn', `批次 ${texts.length} 段失败 code=${e.code}，二分 ${mid}+${texts.length - mid}`);
+        const left = await translateWithRecovery(texts.slice(0, mid), dir, opts);
+        const right = await translateWithRecovery(texts.slice(mid), dir, opts);
+        return {
+          parts: left.parts.concat(right.parts),
+          fallback: left.fallback.concat(right.fallback.map((i) => i + mid))
+        };
+      }
+      recoverLog('warn', `单段失败 code=${e.code}，单条重试一次`);
+      try {
+        const parts = await rawTranslate(texts, dir, { ...opts, push: false });
+        return { parts, fallback: [] };
+      } catch (e2) {
+        if (e2.code === 'aborted' || e2.code === 'disconnected') throw e2;
+        if (e2.code === 'protected' || e.code === 'protected') {
+          recoverLog('warn', '占位符校验两次失败，回落原文');
+          return { parts: [texts[0]], fallback: [0] };
+        }
+        recoverLog('warn', `单段重试仍失败 code=${e2.code}，标记未完成`);
+        return { parts: [null], fallback: [] };
+      }
+    }
+  }
+
+  /**
+   * 批量翻译：先按段查缓存（命中段不发请求），未命中段走三级降级并写回缓存。
+   * 返回 { parts, fallback, failed, cached, cacheMs }。
    */
   async function requestBatch(texts, dir, opts = {}) {
     const n = texts.length;
@@ -980,87 +1030,67 @@
     const cacheMs = Math.max(0, Math.round(performance.now() - tCache));
 
     if (!missIdx.length) {
-      return { parts: hits.slice(), cached: n, cacheMs, allCached: true };
+      return { parts: hits.slice(), fallback: [], failed: [], cached: n, cacheMs, allCached: true };
     }
 
     const missTexts = missIdx.map((i) => texts[i]);
     const m = missTexts.length;
-    const text = missTexts.join('\n\n');
-    const retry = opts.retry === undefined ? 1 : opts.retry;
-    let last = null;
-    let lastParts = null;
-    let parts2 = null;
-
-    for (let attempt = 0; attempt <= retry; attempt++) {
-      throwIfStopped();
-      const id = `trf-${++state.seq}-${Math.random().toString(36).slice(2, 7)}`;
-      state.page.inflightIds.add(id);
-      let res;
-      try {
-        res = await callBackground({
-          type: 'translate', id, text, count: m, to: dir.to, src: dir.srcCode,
-          stream: true, push: !!opts.push
-        });
-      } finally {
-        state.page.inflightIds.delete(id);
-      }
-      if (!res.ok) {
-        last = res;
-        if (res.code === 'aborted') { const e = new Error('已中止'); e.code = 'aborted'; throw e; }
-        if (res.code === 'disconnected' || res.code === 'timeout') {
-          const e = new Error(res.error);
-          e.code = res.code;
-          throw e;
-        }
-        continue;
-      }
-      const parts = splitParagraphs(res.text, m);
-      if (parts.length === m) { parts2 = parts; break; }
-      lastParts = parts;
-      last = { ok: false, code: 'mismatch', error: `译文段数与原文不一致（${parts.length}/${m}）` };
-    }
-
-    if (!parts2 && last && last.code === 'mismatch' && lastParts) {
-      const aligned = forceAlign(lastParts, m);
-      if (aligned && aligned.length === m) parts2 = aligned;
-    }
-    if (!parts2) {
-      const e = new Error((last && last.error) || '翻译失败');
-      e.code = (last && last.code) || 'fail';
-      throw e;
-    }
-
+    const rec = await translateWithRecovery(missTexts, dir, opts);
+    const fallback = new Set(rec.fallback);
+    const failed = [];
     const merged = hits.slice();
-    missIdx.forEach((idx, k) => { merged[idx] = parts2[k]; });
+    missIdx.forEach((idx, k) => {
+      merged[idx] = rec.parts[k];
+      if (rec.parts[k] == null) failed.push(idx);
+    });
 
     if (!opts.noCache) {
-      // 等待写回完成，保证「翻译完立刻再翻」必定命中
-      try {
-        await callBackground({
-          type: 'cache-put',
-          items: missIdx.map((idx, k) => ({ text: texts[idx], t: parts2[k] })),
-          src: dir.srcCode,
-          to: dir.to
-        });
-      } catch (e) { /* 缓存写入失败不影响翻译结果 */ }
+      // 等待写回完成，保证「翻译完立刻再翻」必定命中；回落原文不写缓存
+      const items = [];
+      missIdx.forEach((idx, k) => {
+        if (rec.parts[k] && !fallback.has(k)) items.push({ text: texts[idx], t: rec.parts[k] });
+      });
+      if (items.length) {
+        try {
+          await callBackground({ type: 'cache-put', items, src: dir.srcCode, to: dir.to });
+        } catch (e) { /* 缓存写入失败不影响翻译结果 */ }
+      }
     }
 
-    return { parts: merged, cached: n - m, cacheMs, allCached: false, parts2 };
+    if (!opts.allowPartial && (failed.length || rec.fallback.length)) {
+      throw trfError('fail', '部分段落翻译失败', { failed });
+    }
+
+    return {
+      parts: merged,
+      fallback: Array.from(fallback),
+      failed,
+      cached: n - m,
+      cacheMs,
+      allCached: false
+    };
   }
 
   /** 将任意长度文本按设置切块，顺序翻译后合并 */
   async function translateLong(text, dir, opts = {}) {
     const units = splitIntoUnits(text, state.settings.batchChars, state.settings.batchParagraphs);
     const outs = [];
+    const fallback = [];
+    const failed = [];
+    let offset = 0;
     let cached = 0;
     let cacheMs = 0;
     for (const unit of units) {
-      const r = await requestBatch(unit, dir, opts);
+      const r = await requestBatch(unit, dir, { ...opts, allowPartial: true });
+      r.parts.forEach((p, i) => { if (p == null) failed.push(offset + i); });
+      (r.fallback || []).forEach((i) => fallback.push(offset + i));
       outs.push(...r.parts);
+      offset += unit.length;
       cached += r.cached;
       cacheMs = Math.max(cacheMs, r.cacheMs);
     }
-    return { parts: outs, cached, cacheMs };
+    if (opts.strict && failed.length) throw trfError('fail', '部分内容翻译失败', { failed });
+    return { parts: outs, fallback, failed, cached, cacheMs };
   }
 
   /* ---------------- 功能一：输入框三连空格 ---------------- */
@@ -1635,7 +1665,7 @@
 
     (async () => {
       try {
-        const r = await translateLong(source, dir);
+        const r = await translateLong(source, dir, { strict: true });
         const out = r.parts.join('\n\n');
         if (normText(currentFieldText(field)) !== normText(raw)) {
           fillCtx.field = null;
@@ -2181,7 +2211,7 @@
     return span;
   }
 
-  function renderParagraphs(recs, outs) {
+  function renderParagraphs(recs, outs, fallback = new Set()) {
     recs.forEach((rec, i) => {
       const txt = outs[i];
       if (!txt) return;
@@ -2193,8 +2223,13 @@
         while (rec.el.firstChild) orig.appendChild(rec.el.firstChild);
         rec.el.appendChild(orig);
       }
-      rec.el.appendChild(makeTrSpan(txt));
-      rec.el.setAttribute('data-trf', 'done');
+      const span = makeTrSpan(txt);
+      if (fallback.has(i)) {
+        span.classList.add('trf-fallback');
+        span.title = '占位符校验失败，已回落原文';
+      }
+      rec.el.appendChild(span);
+      rec.el.setAttribute('data-trf', fallback.has(i) ? 'fallback' : 'done');
       state.page.hasTranslations = true;
     });
   }
@@ -2229,11 +2264,12 @@
       bar = document.createElement('div');
       bar.className = 'stat';
       bar.innerHTML = `<div class="row"><span class="title">整页翻译</span>
-        <span class="count">已译 0/0 段</span><button class="btn">中止</button></div>
+        <span class="count">已译 0/0 段</span><button class="retry" hidden>补译未完成</button><button class="btn">中止</button></div>
         <div class="bar"><i></i></div><div class="note"></div>`;
       bar.querySelector('.btn').addEventListener('click', () => {
         stopPageTranslation('已中止');
       });
+      bar.querySelector('.retry').addEventListener('click', () => retryFailed());
       r.appendChild(bar);
     }
     return bar;
@@ -2250,13 +2286,18 @@
     const total = Math.max(state.page.total, done);
     count.textContent = `已译 ${done}/${total} 段`;
     fill.style.width = `${total ? Math.min(100, (done / total) * 100) : 0}%`;
+    const retryBtn = bar.querySelector('.retry');
+    if (retryBtn) {
+      retryBtn.hidden = !state.page.failed;
+      retryBtn.textContent = `补译未完成 ${state.page.failed} 段`;
+    }
     const cacheNote = state.page.cached ? `缓存命中 ${state.page.cached} 段 · ${(state.page.cacheMs / 1000).toFixed(2)}s` : '';
     if (extra.note) {
       note.className = 'note on' + (extra.error ? ' err' : '');
       note.textContent = extra.note + (cacheNote ? ` · ${cacheNote}` : '');
     } else if (state.page.failed) {
-      note.className = 'note on';
-      note.textContent = `失败 ${state.page.failed} 段（已跳过）` + (cacheNote ? ` · ${cacheNote}` : '');
+      note.className = 'note on err';
+      note.textContent = `未完成 ${state.page.failed} 段，可点右上角「补译未完成」重试` + (cacheNote ? ` · ${cacheNote}` : '');
     } else if (cacheNote) {
       note.className = 'note on';
       note.textContent = cacheNote;
@@ -2275,27 +2316,76 @@
     }
   }
 
+  function markUnfinished(recs) {
+    for (const rec of recs) {
+      if (!rec.el || !rec.el.isConnected) continue;
+      rec.el.setAttribute('data-trf', 'failed');
+      rec.el.title = '翻译未完成，可点「补译未完成」重试';
+      if (!state.page.failedRecs.includes(rec)) state.page.failedRecs.push(rec);
+    }
+    state.page.failed = state.page.failedRecs.filter((r) => r.el && r.el.isConnected).length;
+  }
+
+  function clearUnfinished(recs) {
+    for (const rec of recs) {
+      const k = state.page.failedRecs.indexOf(rec);
+      if (k >= 0) state.page.failedRecs.splice(k, 1);
+    }
+  }
+
+  /** 一键补译：把未完成段落重新入队，不增加 total，成功后才计入 done */
+  function retryFailed() {
+    if (!state.page.active) return;
+    const recs = state.page.failedRecs.filter((r) => r.el && r.el.isConnected);
+    if (!recs.length) {
+      state.page.failed = 0;
+      updateStatus();
+      return;
+    }
+    recoverLog('log', `补译未完成 ${recs.length} 段`);
+    clearUnfinished(recs);
+    for (const rec of recs) {
+      rec.el.removeAttribute('title');
+      rec.el.setAttribute('data-trf', 'pending');
+      state.page.queue.unshift(rec);
+    }
+    updateStatus();
+    drainQueue();
+  }
+
   async function runJob(job) {
     const recs = job.paras;
     try {
       let outs;
+      let fallback = new Set();
       if (job.chunked) {
-        const r = await translateLong(recs[0].text, state.page.dir);
-        outs = [r.parts.join('\n\n')];
+        const r = await translateLong(recs[0].text, state.page.dir, { allowPartial: true });
+        const allOk = r.parts.every((p) => p != null);
+        outs = [allOk ? r.parts.join('\n\n') : null];
+        if (allOk && r.fallback.length) fallback = new Set([0]);
         state.page.cached += r.cached;
         state.page.cacheMs = Math.max(state.page.cacheMs, r.cacheMs);
       } else {
-        const r = await requestBatch(recs.map((x) => x.text), state.page.dir);
+        const r = await requestBatch(recs.map((x) => x.text), state.page.dir, { allowPartial: true });
         outs = r.parts;
+        fallback = new Set(r.fallback || []);
         state.page.cached += r.cached;
         state.page.cacheMs = Math.max(state.page.cacheMs, r.cacheMs);
       }
       if (!state.page.active) return;
-      renderParagraphs(recs, outs);
-      state.page.done += recs.length;
+      renderParagraphs(recs, outs, fallback);
+      let okCount = 0;
+      const unfinished = [];
+      recs.forEach((rec, i) => {
+        if (outs[i]) { okCount++; return; }
+        unfinished.push(rec);
+      });
+      clearUnfinished(recs.filter((rec, i) => !!outs[i]));
+      markUnfinished(unfinished);
+      state.page.done += okCount;
       updateStatus();
     } catch (e) {
-      state.page.failed += recs.length;
+      markUnfinished(recs);
       updateStatus();
       if (e.code === 'disconnected') {
         stopPageTranslation(DISCONNECTED_HINT, true);
@@ -2324,7 +2414,8 @@
 
     if (state.page.active && !state.page.stopped) {
       if (state.page.queue.length) { drainQueue(); return; }
-      updateStatus({ note: '翻译完成', hideIn: 3000 });
+      if (state.page.failed) updateStatus();
+      else updateStatus({ note: '翻译完成', hideIn: 3000 });
     }
   }
 
@@ -2361,6 +2452,7 @@
     state.page.total = 0;
     state.page.done = 0;
     state.page.failed = 0;
+    state.page.failedRecs = [];
     state.page.cached = 0;
     state.page.cacheMs = 0;
     state.page.hasTranslations = false;
@@ -2409,6 +2501,7 @@
     state.page.total = 0;
     state.page.done = 0;
     state.page.failed = 0;
+    state.page.failedRecs = [];
     state.page.cached = 0;
     state.page.cacheMs = 0;
     const bar = ui.ensure().querySelector('.stat');

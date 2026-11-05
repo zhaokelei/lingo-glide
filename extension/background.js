@@ -37,7 +37,8 @@ const SYSTEM_PROMPT = [
   '4. 术语前后统一；没有通行译名的术语保留原文并用括号附注。',
   '5. 不增删、不总结、不合并段落、不拆分段落。',
   '6. 目标语言为中文时，简体输出简体、繁体输出繁体，不要混用。',
-  '7. 译文要地道自然，符合目标语言的表达习惯。'
+  '7. 译文要地道自然，符合目标语言的表达习惯。',
+  '8. 文本中的 ⟦TRF数字⟧、⟦TRFO数字⟧、⟦TRFC数字⟧ 是不可翻译占位符，必须原样保留，不得增删、改写、翻译或调整配对顺序。'
 ].join('\n');
 
 const SRC_NAMES = {
@@ -168,20 +169,119 @@ function buildMessages({ text, count, to, src }) {
   ];
 }
 
-/** 清理模型输出中的常见污染：语言前缀、包裹引号 */
+/** 清理模型输出中的常见污染：只处理提示词自身可能诱导出的前缀，不做语言名硬匹配 */
 function cleanOutput(raw) {
   let t = String(raw || '').trim();
-  t = t.replace(/^(译文|翻译结果|翻译|translation|translated)\s*[:：]\s*/i, '');
-  t = t.replace(/^(简体中文|中文|英文|english|chinese)\s*[:：]\s*/i, '');
-  // 整段被同种引号包裹时去掉
-  for (const [a, b] of [['"', '"'], ['“', '”'], ['「', '」'], ["'", "'"], ['‘', '’'], ['《', '》']]) {
-    while (t.startsWith(a) && t.endsWith(b) && t.length > 2) {
-      const inner = t.slice(a.length, t.length - b.length);
-      if (inner.includes(a) || inner.includes(b)) break;
-      t = inner.trim();
+  t = t.replace(/^(译文|翻译结果|翻译)\s*[:：]\s*/, '');
+  t = t.replace(/^(translation|translated)\s*[:：]\s*/i, '');
+  // 整段被同种引号包裹时只脱一层，且内部不得再出现同类引号（避免误伤正常译文）
+  const pairs = [['"', '"'], ['“', '”'], ['「', '」']];
+  for (const [a, b] of pairs) {
+    if (t.startsWith(a) && t.endsWith(b) && t.length > 2) {
+      const ch = t.slice(1, t.length - 1);
+      if (ch.includes(a) || ch.includes(b)) break;
+      t = ch.trim();
+      break;
     }
   }
   return t.trim();
+}
+
+/* ---------------- 占位符保护（代码/URL/邮箱/品牌/成对标签） ----------------- */
+
+const PROTECT_MARK_ALL = /⟦TRF([OC]?)(\d+)⟧/g;
+
+const PROTECT_RULES = [
+  // 成对的 HTML 标签在 protectText 里单独处理，这里只保护落单标签
+  { kind: 'tag', re: /<\/?[A-Za-z][\w:-]*(?:\s[^<>]*)?\/?>/g },
+  { kind: 'url', re: /(?:https?:\/\/|www\.)[^\s<>"'`，。；：！？、）)\]】]+/g },
+  { kind: 'email', re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g },
+  { kind: 'code', re: /`[^`\n]{1,160}`/g },
+  { kind: 'path', re: /(?<![\w])\/(?:[\w.@-]+\/)+[\w.@-]*/g },
+  { kind: 'call', re: /\b[A-Za-z_$][\w$]*\(\)/g },
+  { kind: 'dotted', re: /\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){1,}\b/g },
+  { kind: 'snake', re: /\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b/g },
+  { kind: 'version', re: /\bv?\d+(?:\.\d+){1,3}\b/g },
+  { kind: 'acronym', re: /\b(?:API|URL|URI|HTTP|HTTPS|HTML|CSS|JSON|XML|YAML|CSV|SQL|CPU|GPU|RAM|SSD|USB|PDF|PNG|JPEG|JPG|GIF|SVG|SDK|CLI|IDE|DNS|TCP|UDP|TLS|SSL|VPN|IP|OS|AI|LLM|GPT|DOM|CORS|JWT|SSH|FTP|UI|UX)\b/g },
+  { kind: 'model', re: /\b[A-Za-z]{1,8}\d{2,4}[A-Za-z0-9-]*\b/g },
+  { kind: 'brand', re: /\b[A-Za-z][a-z]+[A-Z][A-Za-z0-9]*\b/g },
+  { kind: 'mark', re: /[A-Za-z0-9][A-Za-z0-9.+_-]{0,24}[™®]/g }
+];
+
+/**
+ * 把不可翻译片段替换成带索引占位符：
+ * - 单个片段 → ⟦TRF0⟧
+ * - 成对标签 → ⟦TRFO0⟧内文⟦TRFC0⟧（内文仍可翻译，标签本身受保护）
+ * 返回 { text, tokens }，tokens 下标即占位符编号。
+ */
+function protectText(text) {
+  const tokens = [];
+  let out = String(text == null ? '' : text);
+  if (!out) return { text: out, tokens };
+  const mint = (kind, value) => { tokens.push({ kind, value }); return tokens.length - 1; };
+
+  // 1) 成对标签：保留内文，标签本身用 OPEN/CLOSE 包裹
+  out = out.replace(/<([A-Za-z][\w:-]*)(?:\s[^<>]*)?>[\s\S]{0,4000}?<\/\1>/g, (m) => {
+    const headEnd = m.indexOf('>');
+    if (headEnd < 0) return m;
+    const closeStart = m.lastIndexOf('</');
+    if (closeStart <= headEnd) return m;
+    const open = m.slice(0, headEnd + 1);
+    const close = m.slice(closeStart);
+    const inner = m.slice(headEnd + 1, closeStart);
+    const id = mint('pair', { open, close });
+    return `⟦TRFO${id}⟧${inner}⟦TRFC${id}⟧`;
+  });
+
+  // 2) 其余片段按规则顺序保护；占位符本身不会命中任何规则
+  for (const rule of PROTECT_RULES) {
+    out = out.replace(rule.re, (m) => `⟦TRF${mint(rule.kind, m)}⟧`);
+  }
+  return { text: out, tokens };
+}
+
+/** 校验并还原占位符；数量、配对、顺序任一不符都返回 ok:false（由调用方降级重试） */
+function restoreProtected(text, tokens) {
+  const s = String(text || '');
+  if (!tokens.length) return { ok: true, text: s };
+  const counts = new Map();
+  let unknown = 0;
+  let m;
+  PROTECT_MARK_ALL.lastIndex = 0;
+  while ((m = PROTECT_MARK_ALL.exec(s))) {
+    const key = `${m[1] || 'S'}${m[2]}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+    if (!tokens[Number(m[2])]) unknown++;
+  }
+  if (unknown) return { ok: false, reason: `未知占位符 ${unknown} 个` };
+  if (!counts.size) return { ok: false, reason: '占位符全部丢失' };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.kind === 'pair') {
+      if (counts.get(`O${i}`) !== 1 || counts.get(`C${i}`) !== 1) {
+        return { ok: false, reason: `成对占位符 #${i} 缺失或重复` };
+      }
+      const oi = s.indexOf(`⟦TRFO${i}⟧`);
+      const ci = s.indexOf(`⟦TRFC${i}⟧`);
+      if (oi < 0 || ci < oi) return { ok: false, reason: `成对占位符 #${i} 顺序错误` };
+    } else if (counts.get(`S${i}`) !== 1) {
+      return { ok: false, reason: `占位符 #${i} 缺失或重复` };
+    }
+  }
+  let out = s;
+  out = out.replace(/⟦TRFO(\d+)⟧/g, (_, d) => (tokens[Number(d)] ? tokens[Number(d)].value.open : ''));
+  out = out.replace(/⟦TRFC(\d+)⟧/g, (_, d) => (tokens[Number(d)] ? tokens[Number(d)].value.close : ''));
+  out = out.replace(/⟦TRF(\d+)⟧/g, (_, d) => (tokens[Number(d)] ? tokens[Number(d)].value : ''));
+  return { ok: true, text: out };
+}
+
+/** 流式推送时把占位符还原成原文，避免气泡里闪现 ⟦TRF0⟧ */
+function visibleProtected(text, tokens) {
+  if (!tokens || !tokens.length) return text;
+  return String(text || '')
+    .replace(/⟦TRFO(\d+)⟧/g, (_, d) => (tokens[Number(d)] ? tokens[Number(d)].value.open : ''))
+    .replace(/⟦TRFC(\d+)⟧/g, (_, d) => (tokens[Number(d)] ? tokens[Number(d)].value.close : ''))
+    .replace(/⟦TRF(\d+)⟧/g, (_, d) => (tokens[Number(d)] ? tokens[Number(d)].value : ''));
 }
 
 class RequestError extends Error {
@@ -210,6 +310,10 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
   const started = Date.now();
   let acc = '';
   let lastPush = 0;
+  const prot = protectText(text);
+  if (prot.tokens.length) {
+    console.info('[trf/protect] 已保护 ' + prot.tokens.length + ' 个片段：' + prot.tokens.map((t) => t.kind).join(','));
+  }
 
   try {
     const body = {
@@ -217,7 +321,7 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
       temperature: Number(settings.temperature ?? DEFAULTS.temperature),
       max_tokens: 1500,
       stream: !!stream,
-      messages: buildMessages({ text, count, to, src })
+      messages: buildMessages({ text: prot.text, count, to, src })
     };
 
     const res = await fetch(apiUrl('/chat/completions'), {
@@ -262,7 +366,7 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
             acc += piece;
             if (push && tabId && Date.now() - lastPush > 150) {
               lastPush = Date.now();
-              safeSendTab(tabId, frameId, { type: 'tr-partial', id, text: acc });
+              safeSendTab(tabId, frameId, { type: 'tr-partial', id, text: visibleProtected(acc, prot.tokens) });
             }
           }
         }
@@ -294,7 +398,17 @@ async function chatCompletion({ id, text, count, to, src, stream, push, tabId, f
       if (!acc) throw new RequestError('http', '服务返回空译文');
     }
 
-    return { ok: true, text: cleanOutput(acc), ms: Date.now() - started };
+    const restored = restoreProtected(cleanOutput(acc), prot.tokens);
+    if (!restored.ok) {
+      console.warn('[trf/protect] 校验失败：' + restored.reason + '（占位符 ' + prot.tokens.length + ' 个，原文 ' + String(text || '').length + ' 字）');
+      return {
+        ok: false, code: 'protected',
+        error: `占位符校验失败：${restored.reason}`,
+        ms: Date.now() - started
+      };
+    }
+    if (prot.tokens.length) console.info('[trf/protect] 校验通过并已还原');
+    return { ok: true, text: restored.text, ms: Date.now() - started, protected: prot.tokens.length };
   } catch (e) {
     if (timedOut) {
       return { ok: false, code: 'timeout', error: `请求超时（${Math.round(timeoutMs / 1000)}s），模型可能在排队或文本过长` };
@@ -328,6 +442,9 @@ function safeSendTab(tabId, frameId, msg) {
 const CACHE_PREFIX = 'trf:c:';
 const CACHE_INDEX_KEY = 'trf:cacheIndex';
 const CACHE_STATS_KEY = 'trf:cacheStats';
+const CACHE_SCHEMA_KEY = 'trf:cacheSchema';
+/* 键结构变化（新增 endpoint/model/prompt 指纹）时递增，旧键整体失效一次 */
+const CACHE_KEY_VERSION = 2;
 const CACHE_MAX = 5000;
 const CACHE_BYTES_LIMIT = 8 * 1024 * 1024;
 
@@ -338,7 +455,26 @@ let cacheStatsDirty = false;
 let cacheFlushTimer = 0;
 let cachePutCount = 0;
 
+let cacheSchemaReady = null;
+
+/** 一次性迁移：旧键结构直接清空，避免换模型/换地址后命中旧译文 */
+async function migrateCacheSchema() {
+  try {
+    const got = await chrome.storage.local.get(CACHE_SCHEMA_KEY);
+    if (Number(got[CACHE_SCHEMA_KEY]) === CACHE_KEY_VERSION) return;
+    const all = await chrome.storage.local.get(null);
+    const victims = Object.keys(all).filter((k) => k.startsWith(CACHE_PREFIX));
+    if (victims.length) await chrome.storage.local.remove(victims);
+    await chrome.storage.local.set({ [CACHE_SCHEMA_KEY]: CACHE_KEY_VERSION });
+    cacheIndex = {};
+    cacheIndexDirty = true;
+    if (victims.length) console.info('[trf/cache] 缓存键结构升级到 v' + CACHE_KEY_VERSION + '，清理旧条目 ' + victims.length + ' 条');
+  } catch (e) { /* 存储不可用时照常工作 */ }
+}
+
 async function ensureCacheMeta() {
+  if (!cacheSchemaReady) cacheSchemaReady = migrateCacheSchema();
+  await cacheSchemaReady;
   if (cacheIndex && cacheStats) return;
   const got = await chrome.storage.local.get([CACHE_INDEX_KEY, CACHE_STATS_KEY]);
   if (!cacheIndex) cacheIndex = got[CACHE_INDEX_KEY] || {};
@@ -366,8 +502,13 @@ async function sha256Hex(str) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+function endpointHost() {
+  try { return new URL(baseUrl()).host; } catch (e) { return 'invalid'; }
+}
+
 async function cacheKeyFor(text, src, to) {
-  return sha256Hex(`${PROMPT_VERSION}|${src || 'auto'}→${to}|${settings.model || DEFAULTS.model}|${text}`);
+  const scope = `${CACHE_KEY_VERSION}|${PROMPT_VERSION}|${settings.model || DEFAULTS.model}|${endpointHost()}`;
+  return sha256Hex(`${scope}|${src || 'auto'}→${to}|${text}`);
 }
 
 function cacheTTLMs() {
