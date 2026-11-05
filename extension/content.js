@@ -1068,37 +1068,98 @@
   const spaceSeq = [];
   let tripleBusy = false;
 
-  function isSearchLike(el) {
-    if (el.getAttribute('type') === 'search') return true;
-    const hint = `${el.name || ''} ${el.id || ''} ${el.getAttribute('aria-label') || ''} ${el.placeholder || ''}`;
-    if (/search|query|搜索|查找/i.test(hint)) return true;
-    if (el.closest('[role="search"], form[action*="search"]')) return true;
-    return false;
+  /* 可翻译控件判定：除密码框外，所有可输入文本的控件都生效
+   * 纳入：input[type=text|search|email|url|tel|number]、textarea、
+   *      [contenteditable]、[role=textbox]，以及 Shadow DOM 内的上述元素
+   * 排除：input[type=password]（三空格必须原样输入，不拦截）、
+   *      checkbox/radio/file/button/submit/reset/color/range/image/hidden */
+  const TEXT_INPUT_TYPES = ['text', 'search', 'email', 'url', 'tel', 'number'];
+  const NON_TEXT_INPUT_TYPES = ['password', 'checkbox', 'radio', 'file', 'button',
+    'submit', 'reset', 'color', 'range', 'image', 'hidden'];
+
+  function inputTypeOf(el) {
+    return String(el.getAttribute('type') || 'text').toLowerCase();
+  }
+
+  /** 向上取父节点：穿透 Shadow DOM（ShadowRoot 用 .host，slot 用 .assignedSlot） */
+  function parentAcrossShadow(node) {
+    if (!node) return null;
+    if (node.assignedSlot) return node.assignedSlot;
+    if (node.parentNode) return node.parentNode;
+    if (node.host) return node.host; // ShadowRoot
+    return null;
+  }
+
+  /** 穿透 Shadow DOM 的 activeElement（document.activeElement 在 shadow 内会止步于宿主） */
+  function deepActiveElement() {
+    let a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    return a;
+  }
+
+  /** 找 contenteditable / role=textbox 祖先，可跨 Shadow 边界 */
+  function editableAncestor(el) {
+    let node = el;
+    while (node) {
+      if (node.nodeType === 1) {
+        if (node.isContentEditable && node.getAttribute('contenteditable') !== 'false') return node;
+        if (node.getAttribute('role') === 'textbox') return node;
+      }
+      node = parentAcrossShadow(node);
+    }
+    return null;
   }
 
   function findField(target) {
     let el = target;
     if (el && el.nodeType === 3) el = el.parentElement;
-    if (!el || !el.closest) return null;
-    const ce = el.closest('[contenteditable]');
-    if (ce && ce.getAttribute('contenteditable') !== 'false' && ce.isContentEditable) {
-      return { el: ce, type: 'ce' };
+    if (!el || el.nodeType !== 1) return null;
+
+    // input / textarea 优先：password 在这里直接返回 null，保证三空格原样落进密码框
+    if (el instanceof HTMLInputElement) {
+      const t = inputTypeOf(el);
+      if (NON_TEXT_INPUT_TYPES.includes(t)) return null;
+      if (!TEXT_INPUT_TYPES.includes(t)) return null;
+      if (el.disabled || el.readOnly) return null;
+      return { el, type: 'input' };
     }
     if (el instanceof HTMLTextAreaElement) {
       if (el.disabled || el.readOnly) return null;
       return { el, type: 'textarea' };
     }
-    if (el instanceof HTMLInputElement) {
-      if (el.disabled || el.readOnly || el.type === 'password' || isSearchLike(el)) return null;
-      const ok = ['text', 'url', 'email', 'tel', ''].includes(el.type) || el.type === 'search';
-      if (!ok) return null;
-      return { el, type: 'input' };
-    }
+
+    // 富文本：contenteditable / role=textbox（Shadow DOM 内同样适用）
+    const ce = editableAncestor(el);
+    if (ce) return { el: ce, type: 'ce' };
     return null;
   }
 
   function readField(field) {
     return field.type === 'ce' ? String(field.el.innerText || '') : String(field.el.value || '');
+  }
+
+  /** 三空格只在光标位于文本末尾（且无选区）时触发；number 等不支持选区 API 的类型直接放行 */
+  function caretAtEnd(field) {
+    if (field.type === 'ce') {
+      const sel = window.getSelection && window.getSelection();
+      if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return false;
+      const node = liveEditable(field);
+      if (!node) return false;
+      const range = sel.getRangeAt(0);
+      try {
+        const tail = document.createRange();
+        tail.selectNodeContents(node);
+        tail.setStart(range.endContainer, range.endOffset);
+        return tail.toString().length === 0;
+      } catch (e) { return true; }
+    }
+    const el = field.el;
+    try {
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      if (start == null || end == null) return true;
+      return start === el.value.length && end === el.value.length;
+    } catch (e) { return true; }
   }
 
   function caretToEnd(el) {
@@ -1119,16 +1180,16 @@
   function liveEditable(field) {
     const el = field.el;
     if (el && el.isConnected && el.isContentEditable) return el;
-    const a = document.activeElement;
+    const a = deepActiveElement();
     if (a && a.isContentEditable) {
-      const ce = (a.closest && a.closest('[contenteditable]:not([contenteditable="false"])')) || a;
+      const ce = (editableAncestor(a)) || a;
       if (ce.isContentEditable) return ce;
     }
     const sel = window.getSelection && window.getSelection();
     const node = sel && sel.anchorNode;
     if (node) {
       const n = node.nodeType === 3 ? node.parentElement : node;
-      const ce = n && n.closest && n.closest('[contenteditable]:not([contenteditable="false"])');
+      const ce = n && (editableAncestor(n));
       if (ce && ce.isContentEditable) return ce;
     }
     return el;
@@ -1164,7 +1225,7 @@
   function fillDiag(field, stage, extra) {
     if (!state.settings.debugFill) return;
     try {
-      const a = document.activeElement;
+      const a = deepActiveElement();
       const sel = window.getSelection && window.getSelection();
       const anchor = sel && sel.anchorNode;
       const anchorEl = anchor ? (anchor.nodeType === 3 ? anchor.parentElement : anchor) : null;
@@ -1606,8 +1667,9 @@
     }
     if (!state.settings.tripleSpaceEnabled || domainIgnored()) return;
 
-    const field = findField(e.target || document.activeElement);
+    const field = fieldFromEvent(e);
     if (!field || state.busyFields.has(field.el)) return;
+    if (!caretAtEnd(field)) { spaceSeq.length = 0; return; }
 
     const gapMax = Math.min(400, Math.max(120, Number(state.settings.tripleSpaceWindowMs) || 800));
     const totalMax = Math.max(200, Number(state.settings.tripleSpaceWindowMs) || 800);
@@ -1664,20 +1726,21 @@
     return comboKeyMatches(e, key);
   }
 
-  /** 快捷键命中时的输入框定位：事件目标 → 选区可编辑祖先 → activeElement */
+  /** 快捷键命中时的输入框定位：事件目标（composedPath 可穿透 Shadow DOM）→ 深 activeElement → 选区可编辑祖先 */
   function fieldFromEvent(e) {
-    const f = findField(e.target || document.activeElement);
-    if (f) return f;
+    let path = [];
+    try { path = typeof e.composedPath === 'function' ? e.composedPath() : []; } catch (err) { path = []; }
+    for (const node of path) {
+      if (!node || node.nodeType !== 1) continue;
+      const f = findField(node);
+      if (f) return f;
+    }
+    const f2 = findField(deepActiveElement());
+    if (f2) return f2;
     const node = window.getSelection && window.getSelection().anchorNode;
     if (node) {
-      const el = node.nodeType === 3 ? node.parentElement : node;
-      const ce = el && el.closest && el.closest('[contenteditable]:not([contenteditable="false"])');
-      if (ce && ce.isContentEditable) return { el: ce, type: 'ce' };
-    }
-    const a = document.activeElement;
-    if (a && a.isContentEditable) {
-      const ce = (a.closest && a.closest('[contenteditable]:not([contenteditable="false"])')) || a;
-      return { el: ce, type: 'ce' };
+      const f3 = findField(node.nodeType === 3 ? node.parentElement : node);
+      if (f3) return f3;
     }
     return null;
   }
