@@ -1,0 +1,27 @@
+/* 整页翻译：译文块样式（页面内真实 DOM，非 Shadow DOM，需要抵御站点 CSS） */
+.trf-tr-block {
+  display: block !important;
+  margin: 0.45em 0 0 0 !important;
+  padding: 0 0 0 0.62em !important;
+  border-left: 2px solid rgba(128, 138, 168, 0.55) !important;
+  font-style: italic !important;
+  opacity: 0.86 !important;
+  font-size: 0.95em !important;
+  line-height: 1.6 !important;
+  text-indent: 0 !important;
+  text-align: left !important;
+  text-transform: none !important;
+  letter-spacing: normal !important;
+  white-space: pre-wrap !important;
+  float: none !important;
+  position: static !important;
+  transform: none !important;
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+  word-break: break-word !important;
+}
+
+/* 整页翻译：仅译文模式下被隐藏的原文副本（保留在 DOM 中以便随时还原） */
+.trf-orig-hidden {
+  display: none !important;
+}

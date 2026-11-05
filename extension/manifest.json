@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "本地翻译 hy-mt2",
+  "version": "1.0.0",
+  "description": "对接本机 llama.cpp 翻译服务：输入框三空格翻译、划词翻译、整页翻译。纯本地，无需账号。",
+  "minimum_chrome_version": "111",
+  "permissions": ["storage", "contextMenus", "scripting", "activeTab"],
+  "host_permissions": ["http://127.0.0.1:8080/*", "<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["input-injector.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ],
+  "options_page": "options.html",
+  "action": {
+    "default_title": "本地翻译",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "commands": {
+    "translate-page": {
+      "suggested_key": {
+        "default": "Alt+T",
+        "mac": "Alt+T"
+      },
+      "description": "翻译 / 还原当前页面"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

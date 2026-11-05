@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地翻译</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="wrap">
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <div class="status-txt">
+        <div class="status-main" id="statusMain">检测中…</div>
+        <div class="status-sub" id="statusSub">http://127.0.0.1:8080/v1</div>
+      </div>
+      <button class="mini" id="retest">重测</button>
+    </div>
+
+    <div class="langbar">
+      <div class="lang-src">
+        <div class="lang-label">源语言</div>
+        <select id="sourceLang" aria-label="源语言"></select>
+      </div>
+      <div class="arrow">→</div>
+      <div class="lang-tgt">
+        <div class="lang-label">目标语言</div>
+        <select id="target" aria-label="目标语言"></select>
+      </div>
+    </div>
+
+    <button class="primary" id="mainBtn">翻译本页</button>
+    <div class="progress" id="progress"></div>
+
+    <div class="switch-list">
+      <label class="row"><span>三空格翻译</span><input type="checkbox" id="swTriple"></label>
+      <label class="row"><span>划词翻译图标</span><input type="checkbox" id="swSelection"></label>
+      <label class="row"><span>页面悬浮球</span><input type="checkbox" id="swBall"></label>
+      <label class="row"><span>英文页自动提示</span><input type="checkbox" id="swAutoPrompt"></label>
+      <label class="row"><span>本网站禁用扩展</span><input type="checkbox" id="swSiteOff"></label>
+      <label class="row"><span>总是翻译这个网站</span><input type="checkbox" id="swAlways"></label>
+    </div>
+
+    <div class="hintline" id="shortcutHint">输入框翻译：⌘ ⇧ Enter</div>
+
+    <div class="cache">
+      <div class="cache-info">
+        <span class="cache-title">翻译缓存</span>
+        <span class="cache-num" id="cacheNum">缓存 0 条 · 0 KB · 命中率 0%</span>
+      </div>
+      <button class="mini" id="clearCache">清除缓存</button>
+    </div>
+
+    <div class="foot">
+      <button class="link" id="openOptions">选项</button>
+      <span class="ver">v<span id="ver">1.0.0</span> · 纯本地</span>
+    </div>
+  </div>
+  <div class="tip" id="tip"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
