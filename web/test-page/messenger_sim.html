@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Messenger 风格富文本框测试</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+  h1 { font-size: 20px; }
+  .box { border: 1px solid #ccd; border-radius: 10px; padding: 12px; min-height: 70px; outline: none; background: #fafbff; }
+  .box:focus { border-color: #6a8cff; box-shadow: 0 0 0 2px rgba(106,140,255,.18); }
+  .meta { font-size: 12px; color: #666; margin-top: 8px; }
+  label { display: block; margin-top: 18px; font-size: 13px; color: #333; }
+  textarea, input { width: 100%; padding: 10px; font-size: 14px; border: 1px solid #ccd; border-radius: 8px; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<h1>Messenger 风格富文本框（模拟）</h1>
+<p>contenteditable + 站点在 keydown 里 stopPropagation，并在 Enter 时发送消息（发送计数会写进页面）。</p>
+
+<div id="mc" class="box" contenteditable="true" role="textbox" aria-label="消息输入框" spellcheck="false"></div>
+<div class="meta">发送次数：<b id="sent">0</b> · 最后按键：<b id="lastKey">-</b></div>
+
+<label>普通 textarea</label>
+<textarea id="plain" rows="3" placeholder="textarea：写英文后三空格或快捷键"></textarea>
+
+<label>普通 input</label>
+<input id="inp" type="text" placeholder="input：写英文后三空格或快捷键">
+
+<script>
+  window.__sent = 0;
+  const mc = document.getElementById('mc');
+  const sentEl = document.getElementById('sent');
+  const lastEl = document.getElementById('lastKey');
+
+  // 模拟 Lexical/Draft：站点自己处理按键，并阻止事件继续冒泡
+  mc.addEventListener('keydown', (e) => {
+    lastEl.textContent = `${e.key}${e.ctrlKey ? '+Ctrl' : ''}${e.metaKey ? '+Cmd' : ''}${e.shiftKey ? '+Shift' : ''}`;
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      window.__sent += 1;
+      sentEl.textContent = String(window.__sent);
+      return;
+    }
+    e.stopPropagation();
+  }, false);
+
+  // 模拟富文本编辑器在 beforeinput 阶段自行接管空格（部分站点会绕过 keydown 的 preventDefault）
+  mc.addEventListener('beforeinput', (e) => {
+    if (e.inputType === 'insertText' && e.data === ' ') {
+      // 正常情况下浏览器负责插入；这里只记录，便于断言事件被扩展拦截后不会再到这里
+      window.__beforeinputSpaces = (window.__beforeinputSpaces || 0) + 1;
+    }
+  }, false);
+</script>
+</body>
+</html>

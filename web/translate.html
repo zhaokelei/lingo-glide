@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>混元翻译 · Hy-MT2 1.8B</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0b0b0d;
+    --panel: #131316;
+    --panel-2: #17171b;
+    --line: #26262b;
+    --gold: #c8a96a;
+    --gold-dim: rgba(200,169,106,.18);
+    --text: #e9e7e2;
+    --muted: #8a8780;
+    --ok: #6fbf8a;
+    --warn: #d98b5f;
+  }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  /* 顶部极细暗金线 */
+  .topline { height: 1px; background: linear-gradient(90deg, transparent, var(--gold), transparent); opacity: .55; }
+
+  header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 16px; padding: 26px 32px 18px;
+  }
+  .brand h1 {
+    font-family: "Songti SC", "STSong", "SimSun", serif;
+    font-size: 21px; font-weight: 600; letter-spacing: .06em;
+    color: var(--text);
+  }
+  .brand h1 span { color: var(--gold); }
+  .brand p { margin-top: 6px; font-size: 11.5px; color: var(--muted); letter-spacing: .12em; }
+
+  .status { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); letter-spacing: .04em; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #4a4a4f; transition: .3s; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px rgba(111,191,138,.55); }
+  .dot.off { background: var(--warn); }
+
+  .dirbar {
+    margin: 0 32px; padding: 10px 16px;
+    border: 1px solid var(--line); border-left: 2px solid var(--gold);
+    background: var(--panel);
+    font-size: 12.5px; letter-spacing: .08em; color: var(--muted);
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .dirbar strong { color: var(--gold); font-weight: 500; }
+  .dirbar .metric { color: #6f6c66; font-variant-numeric: tabular-nums; font-size: 11.5px; }
+
+  main {
+    flex: 1;
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 1px; background: var(--line);
+    margin: 16px 32px 0; border: 1px solid var(--line);
+    min-height: 0;
+  }
+  .pane { background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  .pane-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    font-size: 11.5px; letter-spacing: .14em; color: var(--muted);
+  }
+  .pane-head .cnt { font-variant-numeric: tabular-nums; color: #6f6c66; letter-spacing: 0; }
+
+  textarea {
+    flex: 1; width: 100%; resize: none; border: 0; outline: 0;
+    background: transparent; color: var(--text);
+    padding: 18px 18px 22px; font-size: 15.5px; line-height: 1.85;
+    font-family: inherit; min-height: 300px;
+  }
+  textarea::placeholder { color: #56534d; }
+  .out {
+    flex: 1; padding: 18px 18px 22px; font-size: 15.5px; line-height: 1.85;
+    white-space: pre-wrap; word-break: break-word; overflow-y: auto;
+    min-height: 300px;
+  }
+  .out.empty { color: #56534d; }
+  .out .cursor {
+    display: inline-block; width: 2px; height: 17px; background: var(--gold);
+    vertical-align: -3px; animation: blink 1s steps(2) infinite; margin-left: 1px;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  footer {
+    margin: 14px 32px 26px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-size: 11.5px; color: var(--muted);
+  }
+  button {
+    font: inherit; font-size: 12px; letter-spacing: .06em;
+    background: transparent; color: var(--text);
+    border: 1px solid var(--line); border-radius: 2px;
+    padding: 8px 16px; cursor: pointer; transition: .18s;
+  }
+  button:hover:not(:disabled) { border-color: var(--gold); color: var(--gold); }
+  button:disabled { opacity: .35; cursor: not-allowed; }
+  button.primary { background: var(--gold-dim); border-color: var(--gold); color: var(--gold); }
+  button.primary:hover:not(:disabled) { background: rgba(200,169,106,.28); }
+  .spacer { flex: 1; }
+  .hint { color: #56534d; font-size: 11px; letter-spacing: .03em; }
+
+  .banner {
+    display: none; margin: 16px 32px 0; padding: 14px 16px;
+    border: 1px solid rgba(217,139,95,.4); background: rgba(217,139,95,.07);
+    color: #e0a887; font-size: 13px; line-height: 1.7;
+  }
+  .banner.show { display: block; }
+  .banner code { color: var(--gold); font-size: 12.5px; }
+
+  @media (max-width: 860px) {
+    header { padding: 20px 18px 14px; }
+    .dirbar, .banner { margin-left: 18px; margin-right: 18px; }
+    main { grid-template-columns: 1fr; margin: 14px 18px 0; }
+    .pane { border-bottom: 1px solid var(--line); }
+    textarea, .out { min-height: 190px; }
+    footer { margin: 12px 18px 20px; }
+  }
+</style>
+</head>
+<body>
+<div class="topline"></div>
+
+<header>
+  <div class="brand">
+    <h1>混元翻译 <span>Hy-MT2</span></h1>
+    <p>1.8B · Q4_K_M · 本地 CPU 推理</p>
+  </div>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">检测中</span></div>
+</header>
+
+<div class="banner" id="banner">
+  <strong>本地服务未启动。</strong><br>
+  请先双击桌面上的 <code>启动翻译模型.command</code>，等待窗口显示「就绪」后回到本页重试。
+</div>
+
+<div class="dirbar">
+  <span id="dirText">检测：<strong>等待输入</strong></span>
+  <span class="metric" id="metric"></span>
+</div>
+
+<main>
+  <div class="pane">
+    <div class="pane-head"><span>原文</span><span class="cnt" id="srcCount">0 字</span></div>
+    <textarea id="src" placeholder="输入中文 → 英文；输入英文 / 日文 / 韩文等 → 中文&#10;&#10;⌘/Ctrl + Enter 翻译 · Esc 清空"></textarea>
+  </div>
+  <div class="pane">
+    <div class="pane-head"><span>译文</span><span class="cnt" id="dstCount">0 字</span></div>
+    <div class="out empty" id="dst">译文将在此处流式显示</div>
+  </div>
+</main>
+
+<footer>
+  <button class="primary" id="btnGo">翻译 ⌘↵</button>
+  <button id="btnCopy" disabled>复制译文</button>
+  <button id="btnClear">清空 Esc</button>
+  <span class="spacer"></span>
+  <span class="hint">接口 127.0.0.1:8080 · 模型 hy-mt2</span>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var API = "http://127.0.0.1:8080/v1";
+  var MODEL = "hy-mt2";
+  var MAX_CHARS = 800;          // 超出提示：上下文 4096，800 中文字约 600 tokens
+  var MAX_TOKENS = 2048;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var src = $("src"), dst = $("dst");
+  var btnGo = $("btnGo"), btnCopy = $("btnCopy"), btnClear = $("btnClear");
+  var dirText = $("dirText"), metric = $("metric"), banner = $("banner");
+  var dot = $("dot"), statusText = $("statusText");
+  var busy = false, lastResult = "";
+
+  /* ---------- 语种判定（前端先判，不靠模型猜） ---------- */
+  var LANG_NAME = {
+    zh: "中文", en: "英语", ja: "日语", ko: "韩语",
+    ru: "俄语", ar: "阿拉伯语", fr: "法语", de: "德语",
+    es: "西班牙语", pt: "葡萄牙语", it: "意大利语", th: "泰语", other: "原文语言"
+  };
+
+  function detect(text) {
+    var s = text.replace(/\s+/g, "");
+    if (!s) return "empty";
+    // 纯符号 / 纯数字 / 纯空白
+    if (/^[\p{P}\p{S}\d]+$/u.test(s)) return "empty";
+    var kana = /[\u3040-\u309f\u30a0-\u30ff]/;          // 平假名 + 片假名
+    var hangul = /[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]/; // 谚文
+    var cyrillic = /[\u0400-\u04ff]/;
+    var arabic = /[\u0600-\u06ff]/;
+    var hanRe = /[\u3400-\u4dbf\u4e00-\u9fff]/g;
+    var latinRe = /[A-Za-z]/g;
+
+    var total = s.length;
+    var han = (s.match(hanRe) || []).length;
+    var latin = (s.match(latinRe) || []).length;
+
+    if (kana.test(s)) return "ja";                       // 有假名 → 日语（非中文）
+    if (hangul.test(s)) return "ko";                     // 有韩文 → 韩语
+    if (cyrillic.test(s)) return "ru";
+    if (arabic.test(s)) return "ar";
+    // 汉字占比明显（中文里夹英文缩写/数字/标点仍算中文）
+    if (han > 0 && han / total >= 0.15) return "zh";
+    if (latin > 0) return "en";
+    return "other";
+  }
+
+  function buildPrompt(text, lang) {
+    if (lang === "zh") {
+      return "把下面的中文翻译成地道的英文。只输出英文译文本身：不要任何解释、注释、前缀、引号或原文；"
+        + "保留原文的段落结构与换行；专有名词、代码、URL 和数字保持原样。\n\n" + text;
+    }
+    return "把下面的" + LANG_NAME[lang] + "翻译成简体中文。只输出中文译文本身：不要任何解释、注释、前缀、引号或原文；"
+      + "保留原文的段落结构与换行；专有名词、代码、URL 和数字保持原样。\n\n" + text;
+    }
+
+  function updateDir() {
+    var t = src.value;
+    var lang = detect(t);
+    if (lang === "empty") {
+      dirText.innerHTML = "检测：<strong>等待输入</strong>";
+      return "empty";
+    }
+    var from = LANG_NAME[lang] || "原文";
+    var to = (lang === "zh") ? "English" : "简体中文";
+    dirText.innerHTML = "检测：<strong>" + from + " → " + to + "</strong>";
+    return lang;
+  }
+
+  /* ---------- 文本统计 ---------- */
+  function countChars(t) {
+    if (!t || !t.trim()) return "0 字";
+    var s = t.replace(/\s+/g, "");
+    var cjk = (s.match(/[\u3400-\u4dbf\u4e00-\u9fff]/g) || []).length;
+    var words = (t.match(/[A-Za-z0-9']+/g) || []).length;
+    // 含中文时按实际字符数统计（中英混排更直观），纯外文按词统计
+    if (cjk > 0 && cjk >= words) return s.length + " 字";
+    return words + " 词";
+  }
+
+  /* ---------- 后处理：剥离「以下是翻译」类前缀与包裹引号 ---------- */
+  function cleanup(t) {
+    var s = t.trim();
+    s = s.replace(/^(以下是|这是|下面是)?[^\n:：]{0,12}(翻译|译文|translation)[^\n:：]{0,8}[:：]\s*/i, "");
+    if (/^["“「『]/.test(s) && /["”」』]$/.test(s) && s.length > 2) s = s.slice(1, -1);
+    return s.trim();
+  }
+
+  /* ---------- 渲染 ---------- */
+  function setOut(text, streaming) {
+    dst.classList.remove("empty");
+    dst.textContent = text;
+    if (streaming) {
+      var c = document.createElement("span");
+      c.className = "cursor";
+      dst.appendChild(c);
+    }
+    $("dstCount").textContent = countChars(text);
+  }
+
+  function setStatus(ok) {
+    dot.className = "dot " + (ok ? "on" : "off");
+    statusText.textContent = ok ? "本地服务已连接" : "本地服务未启动";
+  }
+
+  /* ---------- 健康检查 ---------- */
+  function health() {
+    return fetch(API + "/models", { method: "GET" })
+      .then(function (r) { return r.ok; })
+      .catch(function () { return false; });
+  }
+
+  /* ---------- 翻译主流程 ---------- */
+  function translate() {
+    if (busy) return;
+    var text = src.value.trim();
+    var lang = detect(text);
+    if (lang === "empty") {
+      banner.classList.add("show");
+      banner.innerHTML = "<strong>请输入内容。</strong><br>输入中文则译为英文，输入其它语言则译为中文。";
+      return;
+    }
+    if (text.length > MAX_CHARS) {
+      banner.classList.add("show");
+      banner.innerHTML = "<strong>文本较长（" + text.length + " 字符）。</strong><br>"
+        + "本地 1.8B 模型建议单次不超过 " + MAX_CHARS + " 字，超出可能被上下文截断。建议分段翻译。";
+    } else {
+      banner.classList.remove("show");
+    }
+
+    busy = true;
+    btnGo.disabled = true;
+    btnCopy.disabled = true;
+    lastResult = "";
+    dst.classList.remove("empty");
+    dst.textContent = "";
+    $("dstCount").textContent = "翻译中…";
+
+    var t0 = performance.now();
+    var full = "";
+    var firstAt = null;
+    var pending = false;
+
+    var flush = function () {
+      if (!pending) return;
+      pending = false;
+      setOut(full, true);
+      dst.scrollTop = dst.scrollHeight;
+    };
+
+    var body = JSON.stringify({
+      model: MODEL,
+      messages: [{ role: "user", content: buildPrompt(text, lang) }],
+      stream: true,
+      temperature: 0.7,
+      top_p: 0.6,
+      top_k: 20,
+      max_tokens: MAX_TOKENS
+    });
+
+    fetch(API + "/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      if (!resp.body) throw new Error("当前浏览器不支持流式响应");
+      setStatus(true);
+
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder("utf-8");
+      var buf = "";
+
+      function pump() {
+        return reader.read().then(function (res) {
+          if (res.done) return null;
+          buf += decoder.decode(res.value, { stream: true });
+          var lines = buf.split("\n");
+          buf = lines.pop();
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line.indexOf("data:") !== 0) continue;
+            var payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            try {
+              var obj = JSON.parse(payload);
+              var ch = obj.choices && obj.choices[0];
+              var delta = ch && ch.delta && ch.delta.content;
+              if (delta) {
+                if (firstAt === null) firstAt = performance.now();
+                full += delta;
+                pending = true;
+                requestAnimationFrame(flush);
+              }
+            } catch (e) { /* 忽略半包 */ }
+          }
+          return pump();
+        });
+      }
+      return pump();
+    }).then(function () {
+      var clean = cleanup(full);
+      lastResult = clean;
+      setOut(clean, false);
+      btnCopy.disabled = !clean;
+      var total = (performance.now() - t0) / 1000;
+      var rev = firstAt ? (performance.now() - firstAt) / 1000 : total;
+      var approxTokens = Math.max(1, Math.round(clean.length / 2.2));
+      metric.textContent = "首字 " + (firstAt ? Math.round(firstAt - t0) : 0) + " ms · "
+        + approxTokens + " tok / " + rev.toFixed(1) + " s";
+    }).catch(function (err) {
+      var isNet = String(err).indexOf("Failed to fetch") >= 0 || String(err).indexOf("NetworkError") >= 0;
+      setStatus(false);
+      banner.classList.add("show");
+      if (isNet) {
+        banner.innerHTML = "<strong>无法连接本地服务。</strong><br>"
+          + "请先双击桌面上的 <code>启动翻译模型.command</code>，等它显示「就绪」后重试。";
+      } else {
+        banner.innerHTML = "<strong>翻译请求失败：</strong>" + err.message
+          + "<br>请确认服务已启动（端口 8080）。";
+      }
+      $("dstCount").textContent = "0 字";
+      dst.classList.add("empty");
+      dst.textContent = "译文将在此处流式显示";
+    }).then(function () {
+      busy = false;
+      btnGo.disabled = false;
+    });
+  }
+
+  /* ---------- 事件 ---------- */
+  src.addEventListener("input", function () {
+    updateDir();
+    $("srcCount").textContent = countChars(src.value);
+    if (src.value.length > MAX_CHARS) {
+      banner.classList.add("show");
+      banner.innerHTML = "<strong>文本较长（" + src.value.length + " 字符）。</strong><br>"
+        + "本地 1.8B 模型建议单次不超过 " + MAX_CHARS + " 字，超出可能被上下文截断。建议分段翻译。";
+    }
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); translate(); }
+    if (e.key === "Escape") {
+      src.value = ""; dst.classList.add("empty");
+      dst.textContent = "译文将在此处流式显示";
+      $("srcCount").textContent = "0 字"; $("dstCount").textContent = "0 字";
+      metric.textContent = ""; dirText.innerHTML = "检测：<strong>等待输入</strong>";
+      banner.classList.remove("show");
+    }
+  });
+
+  btnGo.addEventListener("click", translate);
+
+  btnClear.addEventListener("click", function () {
+    src.value = ""; dst.classList.add("empty");
+    dst.textContent = "译文将在此处流式显示";
+    $("srcCount").textContent = "0 字"; $("dstCount").textContent = "0 字";
+    metric.textContent = ""; dirText.innerHTML = "检测：<strong>等待输入</strong>";
+    banner.classList.remove("show");
+    src.focus();
+  });
+
+  btnCopy.addEventListener("click", function () {
+    if (!lastResult) return;
+    var done = function () {
+      btnCopy.textContent = "已复制";
+      setTimeout(function () { btnCopy.textContent = "复制译文"; }, 1400);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(lastResult).then(done).catch(function () { fallbackCopy(lastResult); done(); });
+    } else { fallbackCopy(lastResult); done(); }
+  });
+
+  function fallbackCopy(t) {
+    var ta = document.createElement("textarea");
+    ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  /* ---------- 启动时探测服务 ---------- */
+  health().then(function (ok) {
+    setStatus(ok);
+    if (!ok) banner.classList.add("show");
+    else banner.classList.remove("show");
+  });
+  src.focus();
+})();
+</script>
+</body>
+</html>

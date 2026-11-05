@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Lexical 风格编辑器（写入后异步还原）</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+  h1 { font-size: 19px; }
+  .box { border: 1px solid #ccd; border-radius: 10px; padding: 12px; min-height: 80px; outline: none; background: #fafbff; white-space: pre-wrap; }
+  .box:focus { border-color: #6a8cff; box-shadow: 0 0 0 2px rgba(106,140,255,.18); }
+  .meta { font-size: 12px; color: #666; margin-top: 8px; }
+  textarea, input { width: 100%; padding: 10px; font-size: 14px; border: 1px solid #ccd; border-radius: 8px; box-sizing: border-box; }
+  label { display: block; margin-top: 16px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Lexical 风格编辑器（内部 state 覆盖写入）</h1>
+<p id="modeTip"></p>
+<div id="mc" class="box" contenteditable="true" role="textbox" aria-label="消息输入框" spellcheck="false"></div>
+<div class="meta">内部 state：<b id="stateView">-</b> · 重建次数：<b id="rebuild">0</b></div>
+
+<label>普通 textarea</label>
+<textarea id="plain" rows="3" placeholder="textarea"></textarea>
+<label>普通 input</label>
+<input id="inp" type="text" placeholder="input">
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const mode = params.get('mode') || 'revert'; // revert | delayed | lock
+  const mc = document.getElementById('mc');
+  const stateView = document.getElementById('stateView');
+  const rebuildEl = document.getElementById('rebuild');
+  let state = '';
+  let locked = '';
+  let rebuilds = 0;
+  let revertedOnce = false;
+
+  document.getElementById('modeTip').textContent =
+    mode === 'revert' ? '模式：程序写入被内部 state 立即覆盖（execCommand 无效，但接受 paste）'
+      : mode === 'delayed' ? '模式：写入成功 600ms 后被内部 state 还原（守护窗口应重试 paste）'
+        : '模式：完全拒绝写入（beforeinput preventDefault + rAF 还原）';
+
+  if (mode === 'lock') {
+    state = 'The weather is nice today and I plan to go for a walk in the park.';
+    mc.textContent = state;
+  }
+
+  function render() {
+    mc.textContent = state;
+    rebuilds += 1;
+    rebuildEl.textContent = String(rebuilds);
+    stateView.textContent = state.slice(0, 40);
+    // 模拟 Lexical 重建节点：旧节点脱离文档，编辑区仍是 mc
+    const caret = document.createRange();
+    caret.selectNodeContents(mc);
+    caret.collapse(false);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(caret);
+  }
+
+  let lastKeyAt = 0;
+  mc.addEventListener('keydown', (e) => {
+    if (e.key && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete')) lastKeyAt = performance.now();
+  }, true);
+
+  mc.addEventListener('input', (e) => {
+    if (mode === 'lock') return;
+    // 只有紧跟真实按键的 input 才算用户输入；execCommand/paste 等程序写入一律交给编辑器 state 覆盖
+    if (e.isTrusted && performance.now() - lastKeyAt < 120) {
+      state = mc.innerText;
+      locked = state;
+      render();
+      return;
+    }
+    if (mode === 'delayed' && !revertedOnce) {
+      setTimeout(() => {
+        if (!revertedOnce) {
+          revertedOnce = true;
+          state = locked;
+          render();
+          window.__reverted = true;
+        }
+      }, 600);
+    }
+  });
+
+  mc.addEventListener('paste', (e) => {
+    if (mode === 'lock') return;
+    if (e.isTrusted) return; // 真实用户粘贴走浏览器默认行为
+    const t = e.clipboardData && e.clipboardData.getData('text/plain');
+    if (!t) return;
+    e.preventDefault();
+    state = t;
+    locked = t;
+    render();
+    window.__pasteAccepted = (window.__pasteAccepted || 0) + 1;
+  });
+
+  mc.addEventListener('beforeinput', (e) => {
+    if (mode === 'lock') e.preventDefault();
+  });
+
+  function tick() {
+    if (mode === 'revert' || mode === 'lock') {
+      if (mc.innerText !== state) render();
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  window.__mode = mode;
+  window.__getState = () => state;
+})();
+</script>
+</body>
+</html>

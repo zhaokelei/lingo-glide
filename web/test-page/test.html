@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>本地翻译扩展 测试页</title>
+<style>
+body{font:16px/1.65 -apple-system,PingFang SC,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;color:#222;background:#faf9f6}
+h1{font-size:26px} h2{font-size:19px;margin-top:26px}
+textarea,input{width:100%;padding:8px;font:15px/1.5 inherit}
+.box{border:1px solid #ddd;padding:14px;border-radius:8px;margin:18px 0;background:#fff}
+.ed{min-height:70px;border:1px solid #ddd;border-radius:6px;padding:10px;background:#fff}
+code,pre{background:#f2f1ee;padding:2px 6px;border-radius:4px}
+p{margin:0 0 14px} .muted{color:#777}
+label{display:block;margin-top:12px;font-size:14px;color:#555}
+</style></head>
+<body>
+<h1>Local Translation Test Page</h1>
+<p class="muted">A page for verifying triple-space input translation, selection translation and full-page translation.</p>
+
+<div class="box">
+  <label for="plain">Plain textarea</label>
+  <textarea id="plain" rows="3"></textarea>
+  <label for="ctrl">React-style controlled textarea (value tracker simulated)</label>
+  <textarea id="ctrl" rows="3"></textarea>
+  <label for="ce">contenteditable rich text box</label>
+  <div id="ce" class="ed" contenteditable="true"></div>
+  <label for="searchbox">Search box (should never trigger)</label>
+  <input id="searchbox" type="search" placeholder="Search">
+  <label for="pwd">Password field (should never trigger)</label>
+  <input id="pwd" type="password">
+</div>
+
+<article>
+  <p id="p1">Local translation keeps your text on your own machine, which matters when the document is confidential.</p>
+  <p id="p2">The model runs on the CPU, so throughput is limited and long batches must be avoided.</p>
+  <p id="p3">This paragraph is short on purpose, because the test needs to finish in a reasonable time.</p>
+  <p id="p4">Paragraph boundaries must be preserved exactly, otherwise the bilingual layout will look wrong.</p>
+  <p id="p5">Selection translation only sends a request after the user clicks the small floating icon.</p>
+  <h2 id="p6">Batching strategy</h2>
+  <p id="p7">A batch holds at most six paragraphs and eight hundred characters, joined by a blank line.</p>
+  <p id="p8">The server answers with a stream, and each chunk is appended to the previous one.</p>
+  <ul>
+    <li id="p9">Serial requests protect the machine from queueing.</li>
+    <li id="p10">A retry happens once when the paragraph count does not match.</li>
+  </ul>
+  <p id="p11">Read more at <a href="https://example.com">https://example.com</a> or visit the contact page.</p>
+  <p id="p12">2024</p>
+  <pre><code id="p13">const answer = translate(input); // should not be translated</code></pre>
+  <p id="p0cn">这是一段用于验证方向判定的中文文字，选中它应该翻译成英文。</p>
+</article>
+
+<script>
+// 模拟 React 受控组件：状态在 input 事件里更新，rAF 时回写 DOM。
+// 直接赋值 el.value 会被回写覆盖；原生 setter + InputEvent 才能生效。
+(function(){
+  const ta = document.getElementById('ctrl');
+  let state = '';
+  const desc = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+  ta.addEventListener('input', () => { state = ta.value; });
+  (function tick(){
+    if (state !== ta.value) desc.set.call(ta, state);
+    requestAnimationFrame(tick);
+  })();
+})();
+</script>
+</body>
+</html>

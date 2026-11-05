@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Lexical FB composer 模拟</title>
+<style>
+  body { font: 14px/1.6 -apple-system, "PingFang SC", sans-serif; background: #f4f5f7; padding: 24px; }
+  .composer { width: 560px; background: #fff; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.08); padding: 12px; }
+  [contenteditable] { min-height: 88px; outline: none; padding: 10px 12px; border: 1px solid #d9dbe0; border-radius: 10px; font-size: 15px; white-space: pre-wrap; }
+  [contenteditable]:focus { border-color: #1877f2; }
+  .bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  #attach { font-size: 13px; color: #4b4f56; background: #f0f2f5; border-radius: 8px; padding: 6px 10px; }
+  #send { margin-left: auto; background: #1877f2; color: #fff; border: 0; border-radius: 8px; padding: 7px 16px; cursor: pointer; }
+  .muted { color: #8a8d91; font-size: 12px; margin-top: 8px; }
+  .hl { background: #ffebe8; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h3>Lexical（官方库）— 模拟 Facebook composer</h3>
+<div class="composer">
+  <div id="editor" contenteditable="true" spellcheck="false" data-lexical-editor="true"></div>
+  <div class="bar">
+    <span id="attach">📎 附件 / 图片</span>
+    <button id="send">发送</button>
+  </div>
+</div>
+<div class="muted">state 同步：<span id="syncInfo">每 400ms editor.update 触发 reconciliation（模拟 FB 草稿/内部状态同步）</span></div>
+<div class="muted">发送结果：<pre id="sent" style="white-space:pre-wrap;margin:4px 0 0"></pre></div>
+<div class="muted">编辑器内部 state：<pre id="state" style="white-space:pre-wrap;margin:4px 0 0"></pre></div>
+
+<script type="module">
+  import { createEditor, $getRoot, $createParagraphNode, $createTextNode, registerRichText } from './vendor/lexical-bundle.mjs';
+
+  const editorEl = document.getElementById('editor');
+  const editor = createEditor({ onError: (e) => { window.__lexErr = String(e); } });
+  editor.setRootElement(editorEl);
+  registerRichText(editor);
+  window.__editor = editor;
+
+  editor.update(() => {
+    const p = $createParagraphNode();
+    p.append($createTextNode(''));
+    $getRoot().append(p);
+    $getRoot().selectEnd();
+  }, { discrete: true });
+
+  function renderState() {
+    const txt = editor.getEditorState().read(() => $getRoot().getTextContent());
+    document.getElementById('state').textContent = txt;
+  }
+  function renderDom() {
+    const txt = editor.getEditorState().read(() => $getRoot().getTextContent());
+    editorEl.textContent = txt;
+  }
+
+  // 模拟 FB 的内部 state 同步：周期性地用 editor state 重建 DOM。
+  // 旧做法（只在 DOM 上 execCommand/粘贴而不改 state）会被这里覆盖回原文。
+  let syncTimer = null;
+  const params = new URLSearchParams(location.search);
+  if (params.get('sync') !== '0') {
+    syncTimer = setInterval(() => {
+      editor.update(() => { $getRoot().markDirty(); }, { discrete: true });
+      renderState();
+    }, 400);
+  }
+  editor.registerUpdateListener(() => { renderState(); });
+
+  function doSend() {
+    const txt = editor.getEditorState().read(() => $getRoot().getTextContent());
+    window.__lastSentText = txt;
+    document.getElementById('sent').textContent = JSON.stringify({ sent: txt, at: Date.now() });
+    window.__sentCount = (window.__sentCount || 0) + 1;
+    editor.update(() => {
+      $getRoot().clear();
+      $getRoot().append($createParagraphNode().append($createTextNode('')));
+    }, { discrete: true });
+  }
+
+  document.getElementById('send').addEventListener('click', doSend);
+
+  // 模拟 FB：编辑区内按 Enter（不带修饰键）即发送
+  editorEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      doSend();
+    }
+  }, true);
+
+  // 模拟站点内部 state 把内容还原成某段文本（S2 用）
+  window.__siteRevert = (t) => {
+    editor.update(() => {
+      const r = $getRoot();
+      r.clear();
+      const p = $createParagraphNode();
+      p.append($createTextNode(t));
+      r.append(p);
+      r.selectEnd();
+    }, { discrete: true });
+  };
+
+  window.__stateText = () => editor.getEditorState().read(() => $getRoot().getTextContent());
+  window.__lexClear = () => {
+    editor.update(() => {
+      const r = $getRoot();
+      r.clear();
+      r.append($createParagraphNode());
+    }, { discrete: true });
+    document.getElementById('editor').focus();
+  };
+  window.__lexicalReady = true;
+</script>
+</body>
+</html>
