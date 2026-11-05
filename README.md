@@ -1,4 +1,4 @@
-# Hy-MT2 local translator
+# Lingo Glide
 
 A browser extension (Chrome / Edge, Manifest V3) that translates in the page using a local llama.cpp server. No cloud API, no account, no key.
 
