@@ -3083,6 +3083,178 @@
     else translatePageWithTarget();
   }
 
+  /* ---------------- Ctrl + 左键点击：只翻译被点中的段落 ---------------- */
+
+  const paraPending = new WeakMap();
+  let lastParaHit = { block: null, at: 0 };
+
+  function notifyPara(msg, opts) {
+    if (IS_SUBFRAME) return;   // 子 frame 不挂 UI，避免每个 iframe 各弹一个提示
+    ui.toast(msg, opts);
+  }
+
+  /** 从事件里取真实元素：composedPath 可穿透 shadow DOM，避免只拿到宿主 */
+  function clickElementFrom(e) {
+    try {
+      if (typeof e.composedPath === 'function') {
+        for (const n of e.composedPath()) if (n && n.nodeType === 1) return n;
+      }
+    } catch (err) { /* ignore */ }
+    const t = e.target;
+    if (!t) return null;
+    return t.nodeType === 1 ? t : t.parentElement;
+  }
+
+  /** 点击点所在的可翻译段落；输入控件、页码禁区、译文块本身都不算 */
+  function paragraphForClick(el) {
+    if (!el || typeof el.closest !== 'function') return null;
+    if (el.closest('#trf-root')) return null;
+    if (el.closest('[data-trf="tr"],[data-trf="wrap"]')) return null;
+    if (el.closest('input,textarea,select,button,[contenteditable]:not([contenteditable="false"]),[role="textbox"]')) return null;
+    const block = findBlock(el);
+    if (!block || block === document.body) return null;
+    const mark = block.getAttribute('data-trf');
+    if (mark === 'done' || mark === 'fallback') return block;   // 已译段落：再点即还原
+    if (mark) return null;                                      // pending/deferred/failed 交给整页流程
+    if (block.closest(SKIP_SELECTOR)) return null;
+    return block;
+  }
+
+  /** 只取该段自身的原文文本，排除已插入的译文/包装/仅译文模式的原文副本 */
+  function singleBlockText(block) {
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        if (parent.closest('[data-trf="tr"],[data-trf="wrap"],[data-trf="orig"]')) return NodeFilter.FILTER_REJECT;
+        if (parent.closest(SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let text = '';
+    let node = null;
+    while ((node = walker.nextNode())) {
+      const raw = node.nodeValue;
+      if (text && /[A-Za-z0-9]$/.test(text) && /^[A-Za-z0-9]/.test(raw)) text += ' ';
+      text += raw;
+    }
+    return text.replace(/\s+/g, ' ').trim();
+  }
+
+  /** 还原单个段落：与整页还原同一套顺序（先还原原文副本，再删译文，最后清标记） */
+  function restoreSingleBlock(block) {
+    block.querySelectorAll('[data-trf="orig"]').forEach((orig) => {
+      const parent = orig.parentElement;
+      if (!parent) { orig.remove(); return; }
+      while (orig.firstChild) parent.insertBefore(orig.firstChild, orig);
+      orig.remove();
+    });
+    block.querySelectorAll('[data-trf="tr"],[data-trf="wrap"]').forEach((el) => el.remove());
+    block.querySelectorAll('[data-trf]').forEach((el) => el.removeAttribute('data-trf'));
+    block.removeAttribute('data-trf');
+    block.classList.remove('trf-src');
+    let remain = false;
+    eachRoot((root) => { if (!remain && root.querySelector('[data-trf="tr"]')) remain = true; });
+    if (!remain) {
+      state.page.hasTranslations = false;
+      updateBall();
+    }
+  }
+
+  async function translateSingleBlock(block) {
+    if (paraPending.has(block) || !block.isConnected) return;
+    const text = singleBlockText(block);
+    if (!text || looksLikeNoise(text)) { notifyPara('这里没有可翻译的正文'); return; }
+    const dir = resolveDirection(text, state.settings.targetLang || 'zh-Hans', state.settings.sourceLang);
+    if (dir.err) { notifyPara(dir.err === 'unknown' ? '无法识别这段的语言' : '这里没有可翻译的正文'); return; }
+    // 单段翻译不参与整页队列；上一轮整页还原留下的 stopped 标记不应拦住它
+    if (!state.page.active) state.page.stopped = false;
+    // 段落位于影子根内时，先登记并注入译文样式（整页流程才会自动收集影子根）
+    try {
+      const root = block.getRootNode && block.getRootNode();
+      if (root && root !== document && root.host) registerShadowRoot(root);
+    } catch (e) { /* ignore */ }
+
+    const task = {};
+    paraPending.set(block, task);
+    notifyPara('正在翻译这一段…', { sticky: true });
+    try {
+      let out = null;
+      let fallback = new Set();
+      let cached = 0;
+      let cacheMs = 0;
+      const limitChars = Math.max(200, Number(state.settings.batchChars) || 800);
+      if (text.length > limitChars) {
+        const r = await translateLong(text, dir, { allowPartial: true });
+        const allOk = r.parts.every((p) => p != null);
+        out = allOk ? r.parts.join('\n\n') : null;
+        if (allOk && r.fallback.length) fallback = new Set([0]);
+        cached = r.cached;
+        cacheMs = r.cacheMs;
+      } else {
+        const r = await requestBatch([text], dir, { allowPartial: true });
+        out = r.parts && r.parts[0];
+        fallback = new Set((r.fallback || []).map(Number));
+        cached = r.cached;
+        cacheMs = r.cacheMs;
+      }
+      if (paraPending.get(block) !== task || !block.isConnected) return;
+      if (!out) {
+        block.removeAttribute('data-trf');
+        notifyPara('这一段翻译失败，已保留原文', { type: 'err', duration: 5000 });
+        return;
+      }
+      block.setAttribute('data-trf', fallback.has(0) ? 'fallback' : 'done');
+      renderParagraphs([{ el: block, text }], [out], fallback);
+      updateBall();
+      const cacheTag = cached ? ` · 缓存命中 ${(cacheMs / 1000).toFixed(2)}s` : '';
+      notifyPara(`本段已翻译为${targetLabelOf(dir.to)}${cacheTag}`, { type: 'ok', duration: 1800 });
+    } catch (e) {
+      if (!block.querySelector('[data-trf="tr"]')) block.removeAttribute('data-trf');
+      if (e.code === 'disconnected') notifyPara(DISCONNECTED_HINT, { type: 'err', duration: 7000 });
+      else if (e.code === 'aborted') notifyPara('已中止');
+      else notifyPara(`本段翻译失败：${e.message || '未知错误'}`, { type: 'err', duration: 5000 });
+    } finally {
+      if (paraPending.get(block) === task) paraPending.delete(block);
+    }
+  }
+
+  function runParagraphClick(block) {
+    const mark = block.getAttribute('data-trf');
+    if (mark === 'done' || mark === 'fallback') restoreSingleBlock(block);
+    else translateSingleBlock(block);
+  }
+
+  /** Mac 上 Control+左键被浏览器当成次要点击：只有 pointerdown/mousedown/mouseup，没有 click，
+   *  真实环境中还会补一个 contextmenu。三个事件都接，350ms 内同一段只处理一次。 */
+  function onParagraphTrigger(e) {
+    e = e || window.event;
+    if (!e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
+    const isCtx = e.type === 'contextmenu';
+    const isUp = e.type === 'mouseup';
+    if (!isCtx && !isUp && e.type !== 'click') return;
+    if (!isCtx && typeof e.button === 'number' && e.button !== 0) return;
+    if (state.site.disabled || domainIgnored()) return;
+    const block = paragraphForClick(clickElementFrom(e));
+    if (!block) return;
+    const now = performance.now();
+    if (lastParaHit.block === block && now - lastParaHit.at < 350) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return;
+    }
+    lastParaHit = { block, at: now };
+    // 链接跳转、新标签打开、系统右键菜单都在这里拦掉，段落翻译照常进行
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    runParagraphClick(block);
+  }
+
+  window.addEventListener('click', onParagraphTrigger, true);
+  window.addEventListener('mouseup', onParagraphTrigger, true);
+  window.addEventListener('contextmenu', onParagraphTrigger, true);
+
   /** MutationObserver 的增量扫描入口：交给 scanAllRoots，由其合并并发扫描 */
   function scanAndQueue() {
     if (!state.page.active || state.page.stopped) return;
