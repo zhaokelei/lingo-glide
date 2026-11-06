@@ -254,6 +254,23 @@ function cleanOutput(raw) {
   return t.trim();
 }
 
+/** 按目标语言统一句末标点：中文目标把行尾英文标点换成全角；拉丁系目标去掉中文标点（日韩保持原样） */
+function normalizePunct(text, to) {
+  let t = String(text || '');
+  if (!t) return t;
+  const code = String(to || '');
+  if (/^zh/i.test(code)) {
+    return t.replace(/([\u4e00-\u9fff])([.!?])($|\s)/g, (m, w, p, tail) =>
+      w + (p === '.' ? '。' : p === '!' ? '！' : '？') + tail);
+  }
+  if (/^(en|fr|de|es|ru)/i.test(code)) {
+    return t.replace(/[。！？；：，（）]/g, (ch) => ({
+      '。': '.', '！': '!', '？': '?', '；': ';', '：': ':', '，': ',', '（': '(', '）': ')'
+    }[ch] || ch));
+  }
+  return t;
+}
+
 /* ---------------- 占位符保护（代码/URL/邮箱/品牌/成对标签） ----------------- */
 
 const PROTECT_MARK_ALL = /⟦TRF([OC]?)(\d+)⟧/g;
@@ -303,6 +320,11 @@ function protectText(text) {
   // 2) 其余片段按规则顺序保护；占位符本身不会命中任何规则
   for (const rule of PROTECT_RULES) {
     out = out.replace(rule.re, (m) => `⟦TRF${mint(rule.kind, m)}⟧`);
+  }
+  // 3) 整个输入被保护成一个标记（短词/单词级输入命中品牌、缩写等规则）：
+  //    宁可少保护，也不把整段内容变成占位符，否则模型只看到 ⟦TRF0⟧ 等于整段没翻
+  if (tokens.length === 1 && /^⟦TRF0⟧$/.test(out.trim())) {
+    return { text: String(text), tokens: [] };
   }
   return { text: out, tokens };
 }
@@ -483,7 +505,7 @@ async function requestOnce({ id, partialId, text, count, to, src, stream, push, 
       };
     }
     if (prot.tokens.length) console.info('[trf/protect] 校验通过并已还原');
-    return { ok: true, text: restored.text, ms: Date.now() - started, protected: prot.tokens.length };
+    return { ok: true, text: normalizePunct(restored.text, to), ms: Date.now() - started, protected: prot.tokens.length };
   } catch (e) {
     if (timedOut) {
       return { ok: false, code: 'timeout', error: `请求超时（${Math.round(timeoutMs / 1000)}s），模型可能在排队或文本过长` };
@@ -1010,7 +1032,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const frameId = sender.tab && sender.tab.id ? sender.frameId : undefined;
     translateInBatches({ ...msg, tabId, frameId })
       .then(sendResponse)
-      .catch((e) => sendResponse({ ok: false, code: 'internal', error: `内部错误：${e && e.message ? e.message : e}` }));
+      .catch((e) => {
+        console.warn('[trf] translate 内部异常：', e && e.stack ? e.stack : e);
+        sendResponse({ ok: false, code: 'internal', error: `内部错误：${e && e.message ? e.message : e}` });
+      });
     return true;
   }
 

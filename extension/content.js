@@ -90,6 +90,7 @@
     site: { disabled: false, neverPrompt: false, alwaysTranslate: false },
     pageLang: null,
     ball: { el: null, cardEl: null, side: 'right', top: 16, dragging: false, moved: false, lastToast: 0 },
+    bg: { dead: false },
     page: {
       active: false,
       stopped: false,
@@ -690,8 +691,20 @@
     return list.some((p) => (p.startsWith('*.') ? host.endsWith(p.slice(1)) : host === p || host.endsWith('.' + p)));
   }
 
+  /** 扩展上下文是否还有效：扩展被重新加载/更新后，旧页面的 chrome.runtime 会失效 */
+  function runtimeAlive() {
+    try { return !!(chrome.runtime && chrome.runtime.id); } catch (e) { return false; }
+  }
+
+  const BG_DEAD_HINT = '扩展已被重新加载或更新，请刷新当前页面后重试';
+
   function callBackground(msg) {
     return new Promise((resolve) => {
+      if (state.bg.dead || !runtimeAlive()) {
+        state.bg.dead = true;
+        resolve({ ok: false, code: 'context', error: BG_DEAD_HINT });
+        return;
+      }
       let done = false;
       const finish = (v) => {
         if (done) return;
@@ -702,19 +715,28 @@
       // 后台休眠或消息丢失时不能无限等待
       const waitMs = Math.max(15000, (Number(state.settings.timeoutSec) || 60) * 1000 + 8000);
       const timer = setTimeout(() => {
-        finish({ ok: false, code: 'timeout', error: '扩展后台无响应，请刷新页面后重试' });
+        finish({ ok: false, code: 'timeout', error: '扩展后台无响应，请稍后重试' });
       }, msg.type === 'translate' ? waitMs : 5000);
       try {
         chrome.runtime.sendMessage(msg, (resp) => {
           const err = chrome.runtime.lastError;
           if (err) {
-            finish({ ok: false, code: 'internal', error: '扩展后台无响应，请到 chrome://extensions 重新加载扩展' });
+            const alive = runtimeAlive();
+            if (!alive) state.bg.dead = true;
+            finish({
+              ok: false,
+              code: alive ? 'internal' : 'context',
+              error: alive ? `扩展后台无响应（${String(err.message || '')}），请稍后重试` : BG_DEAD_HINT
+            });
             return;
           }
+          state.bg.dead = false;
           finish(resp || { ok: false, code: 'internal', error: '扩展后台无响应' });
         });
       } catch (e) {
-        finish({ ok: false, code: 'internal', error: '扩展已更新，请刷新页面后重试' });
+        const alive = runtimeAlive();
+        if (!alive) state.bg.dead = true;
+        finish({ ok: false, code: alive ? 'internal' : 'context', error: alive ? '扩展后台无响应' : BG_DEAD_HINT });
       }
     });
   }
@@ -747,6 +769,15 @@
       max-width: min(92vw, 430px); pointer-events: auto; }
     .bubble .hd { display: flex; align-items: center; gap: 8px; padding: 8px 12px 6px;
       border-bottom: 1px solid rgba(255,255,255,.06); }
+    .bubble .dirs { display: flex; align-items: center; gap: 6px; padding: 6px 12px 7px;
+      border-bottom: 1px solid rgba(255,255,255,.06); flex-wrap: wrap; }
+    .bubble .dirs select { flex: 1 1 92px; min-width: 78px; max-width: 150px;
+      background: #1b1c21; color: #e9e5da; border: 1px solid rgba(255,255,255,.18);
+      border-radius: 6px; font-size: 11px; padding: 2px 4px; outline: none; cursor: pointer; }
+    .bubble .dirs select:focus { border-color: rgba(200,169,106,.75); }
+    .bubble .dirs select option { background: #1b1c21; color: #e9e5da; }
+    .bubble .dirs .arrow { color: #8b8d96; font-size: 11px; }
+    .bubble .dirs-note { color: #7f828c; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
     .bubble .tag { color: #c8a96a; font-size: 11px; letter-spacing: .03em; flex: 1; min-width: 0;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bubble .pin { color: #7f828c; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
@@ -1064,8 +1095,38 @@
 
   const RECOVER_BISECT_CODES = new Set(['mismatch', 'empty', 'protected', 'timeout']);
 
+  /** 失败日志合并成一条摘要，避免一次整页翻译刷出十几条同名错误占满扩展管理页 */
+  const recoverStats = { n: 0, codes: {}, samples: [] };
+  let recoverTimer = 0;
+
   function recoverLog(level, msg) {
-    try { (console[level] || console.log)('[trf/recover]', msg); } catch (e) { /* ignore */ }
+    try {
+      const s = String(msg || '');
+      const m = /code=([a-z]+)/.exec(s);
+      const code = m ? m[1] : 'other';
+      recoverStats.n += 1;
+      recoverStats.codes[code] = (recoverStats.codes[code] || 0) + 1;
+      if (code === 'internal' && recoverStats.samples.length < 3) {
+        // internal 的唯一来源是后台抛异常或消息端口断开，保留原始文案便于定位
+        recoverStats.samples.push(s.replace(/code=[a-z]+/g, '').trim());
+      }
+      if (recoverTimer) return;
+      recoverTimer = setTimeout(() => {
+        recoverTimer = 0;
+        const n = recoverStats.n;
+        const codes = recoverStats.codes;
+        const samples = recoverStats.samples;
+        recoverStats.n = 0;
+        recoverStats.codes = {};
+        recoverStats.samples = [];
+        if (!n) return;
+        const detail = Object.keys(codes).map((k) => `${k}×${codes[k]}`).join('，');
+        const extra = samples.length ? `；internal 原文：${samples.join(' | ')}` : '';
+        try {
+          console.info(`[trf/recover] 本次翻译 ${n} 段失败（${detail}），已回落原文或标记未完成${extra}`);
+        } catch (e) { /* ignore */ }
+      }, 800);
+    } catch (e) { /* ignore */ }
   }
 
   function trfError(code, message, extra) {
@@ -1112,7 +1173,7 @@
       const parts = await rawTranslate(texts, dir, opts);
       return { parts, fallback: [] };
     } catch (e) {
-      if (e.code === 'aborted' || e.code === 'disconnected') throw e;
+      if (e.code === 'aborted' || e.code === 'disconnected' || e.code === 'context') throw e;
       if (texts.length > 1) {
         if (!RECOVER_BISECT_CODES.has(e.code)) throw e;
         const mid = Math.ceil(texts.length / 2);
@@ -1125,11 +1186,12 @@
         };
       }
       recoverLog('warn', `单段失败 code=${e.code}，单条重试一次`);
+      if (e.code === 'internal') await sleep(500); // 后台刚被唤醒/端口刚断开时给一次缓冲，避免直接判死
       try {
         const parts = await rawTranslate(texts, dir, { ...opts, push: false });
         return { parts, fallback: [] };
       } catch (e2) {
-        if (e2.code === 'aborted' || e2.code === 'disconnected') throw e2;
+        if (e2.code === 'aborted' || e2.code === 'disconnected' || e2.code === 'context') throw e2;
         if (e2.code === 'protected' || e.code === 'protected') {
           recoverLog('warn', '占位符校验两次失败，回落原文');
           return { parts: [texts[0]], fallback: [0] };
@@ -2080,6 +2142,8 @@
   }
 
   function openBubble(text) {
+    // 划词与整页互不影响：整页停止/还原后的 stopped 不能拦住划词
+    if (!state.page.active) state.page.stopped = false;
     // 单实例：已有气泡时直接替换内容，不会叠出第二个
     closeBubble();
     const r = ui.ensure();
@@ -2089,7 +2153,10 @@
     bubbleEl.style.left = '0px';
     bubbleEl.style.top = '0px';
 
-    const dir = resolveDirection(text, null, followSrcLang());
+    // 气泡内的方向是临时的：只影响这一次划词，不写回全局设置
+    const initSrc = followSrcLang() || 'auto';
+    const initTo = state.settings.targetLang || 'zh-Hans';
+    const dir = resolveDirection(text, initTo, initSrc);
     bubbleEl.innerHTML = '';
 
     const hd = document.createElement('div');
@@ -2106,6 +2173,43 @@
     hd.appendChild(pin);
     hd.appendChild(cacheChip);
     bubbleEl.appendChild(hd);
+
+    // 临时源语言 / 目标语言：选项复用整页与输入框同一套语言代码
+    const dirs = document.createElement('div');
+    dirs.className = 'dirs';
+    const srcSel = document.createElement('select');
+    srcSel.className = 'b-src';
+    srcSel.setAttribute('aria-label', '源语言');
+    SOURCE_LANGS.forEach((l) => {
+      const o = document.createElement('option');
+      o.value = l.code;
+      o.textContent = l.label;
+      srcSel.appendChild(o);
+    });
+    const arrow = document.createElement('span');
+    arrow.className = 'arrow';
+    arrow.textContent = '→';
+    const toSel = document.createElement('select');
+    toSel.className = 'b-to';
+    toSel.setAttribute('aria-label', '目标语言');
+    TARGETS.filter((t) => t.code !== 'auto').forEach((t) => {
+      const o = document.createElement('option');
+      o.value = t.code;
+      o.textContent = t.label;
+      toSel.appendChild(o);
+    });
+    const note = document.createElement('span');
+    note.className = 'dirs-note';
+    note.textContent = '仅本次';
+    srcSel.value = initSrc;
+    const initToCode = Array.prototype.some.call(toSel.options, (o) => o.value === initTo)
+      ? initTo : (dir.to || 'zh-Hans');
+    toSel.value = initToCode;
+    dirs.appendChild(srcSel);
+    dirs.appendChild(arrow);
+    dirs.appendChild(toSel);
+    dirs.appendChild(note);
+    bubbleEl.appendChild(dirs);
 
     const body = document.createElement('div');
     body.className = 'body';
@@ -2146,69 +2250,120 @@
     r.appendChild(bubbleEl);
     positionBubble(bubbleEl);
 
-    if (dir.err) {
-      body.className = 'body empty';
-      body.textContent = dir.err === 'empty' ? '请先选中内容' : '无法识别选中内容的语言';
-      document.addEventListener('keydown', onDocKeydown, true);
-      window.addEventListener('scroll', onWindowScroll, { capture: true, passive: true });
-      return;
-    }
-
-    body.className = 'body empty';
-    body.textContent = '翻译中…';
-
-    const id = `trf-sel-${++state.seq}-${Math.random().toString(36).slice(2, 7)}`;
-    bubbleId = id;
-    bubbleReqId = id;
-
-    // 流式增量（后台节流推送）
-    const onPartial = (partialText) => {
-      if (!bubbleEl || bubbleId !== id || !partialText) return;
-      body.className = 'body';
-      body.textContent = partialText;
-    };
-    pendingPartialHandler = onPartial;
-
     document.addEventListener('keydown', onDocKeydown, true);
     window.addEventListener('scroll', onWindowScroll, { capture: true, passive: true });
 
-    (async () => {
-      let dirForText = dir;
-      const units = splitIntoUnits(text, state.settings.batchChars, state.settings.batchParagraphs);
-      try {
-        let out = '';
-        let cachedTotal = 0;
-        let cacheMs = 0;
-        for (const unit of units) {
-          if (bubbleId !== id) return;
-          const r = await requestBatch(unit, dirForText, { push: true });
-          cachedTotal += r.cached;
-          cacheMs = Math.max(cacheMs, r.cacheMs);
-          out = out ? `${out}\n\n${r.parts.join('\n\n')}` : r.parts.join('\n\n');
-        }
-        if (!bubbleEl || bubbleId !== id) return;
-        bubbleId = null;
-        bubbleReqId = null;
-        body.className = 'body';
-        body.textContent = out;
-        body.dataset.text = out;
-        copyBtn.disabled = false;
-        if (cachedTotal > 0) {
-          cacheChip.textContent = `缓存 · ${(cacheMs / 1000).toFixed(2)}s`;
-          cacheChip.classList.add('on');
-        }
-        positionBubble(bubbleEl);
-      } catch (e) {
-        if (!bubbleEl || bubbleId !== id) return;
-        bubbleId = null;
-        bubbleReqId = null;
-        body.className = 'body empty';
-        body.textContent = e.code === 'disconnected' ? DISCONNECTED_HINT
-          : e.code === 'aborted' ? '已中止'
-            : `翻译失败：${e.message || '未知错误'}`;
-        positionBubble(bubbleEl);
+    function showDirErr(d) {
+      body.className = 'body empty';
+      body.dataset.text = '';
+      copyBtn.disabled = true;
+      body.textContent = d.err === 'empty' ? '请先选中内容' : '无法识别选中内容的语言';
+      tag.textContent = '无法识别语言';
+    }
+
+    function startTranslation(d) {
+      // 换方向时先取消上一方向的在途请求，旧回调随即失效
+      if (bubbleId) {
+        try { callBackground({ type: 'cancel', id: bubbleId }); } catch (e) { /* ignore */ }
       }
-    })();
+      bubbleId = null;
+      bubbleReqId = null;
+      pendingPartialHandler = null;
+
+      const id = `trf-sel-${++state.seq}-${Math.random().toString(36).slice(2, 7)}`;
+      bubbleId = id;
+      bubbleReqId = id;
+      tag.textContent = d.label;
+      body.className = 'body empty';
+      body.textContent = '翻译中…';
+      body.dataset.text = '';
+      copyBtn.disabled = true;
+      cacheChip.textContent = '';
+      cacheChip.classList.remove('on');
+
+      // 流式增量（后台节流推送）
+      const onPartial = (partialText) => {
+        if (!bubbleEl || bubbleId !== id || !partialText) return;
+        body.className = 'body';
+        body.textContent = partialText;
+      };
+      pendingPartialHandler = onPartial;
+
+      (async () => {
+        const units = splitIntoUnits(text, state.settings.batchChars, state.settings.batchParagraphs);
+        try {
+          let out = '';
+          let cachedTotal = 0;
+          let cacheMs = 0;
+          for (const unit of units) {
+            if (bubbleId !== id) return;
+            const r2 = await requestBatch(unit, d, { push: true });
+            cachedTotal += r2.cached;
+            cacheMs = Math.max(cacheMs, r2.cacheMs);
+            out = out ? `${out}\n\n${r2.parts.join('\n\n')}` : r2.parts.join('\n\n');
+          }
+          if (!bubbleEl || bubbleId !== id) return;
+          bubbleId = null;
+          bubbleReqId = null;
+          body.className = 'body';
+          body.textContent = out;
+          body.dataset.text = out;
+          copyBtn.disabled = false;
+          if (cachedTotal > 0) {
+            cacheChip.textContent = `缓存 · ${(cacheMs / 1000).toFixed(2)}s`;
+            cacheChip.classList.add('on');
+          }
+          positionBubble(bubbleEl);
+        } catch (e) {
+          if (!bubbleEl || bubbleId !== id) return;
+          bubbleId = null;
+          bubbleReqId = null;
+          body.className = 'body empty';
+          body.textContent = e.code === 'disconnected' ? DISCONNECTED_HINT
+            : e.code === 'aborted' ? '已中止'
+              : `翻译失败：${e.message || '未知错误'}`;
+          positionBubble(bubbleEl);
+        }
+      })();
+    }
+
+    function sameLang(a, b) {
+      const norm = (c) => (c === 'zh' ? 'zh-Hans' : c);
+      return !!(a && b && a !== 'auto' && b !== 'auto' && norm(a) === norm(b));
+    }
+
+    /** 下拉变更：临时方向立即生效，已出译文按新方向重译 */
+    function applyDir() {
+      const src = srcSel.value;
+      const to = toSel.value;
+      const d = resolveDirection(text, to, src);
+      if (d.err) { showDirErr(d); positionBubble(bubbleEl); return; }
+      // 自动检测时按实际识别出的源语言比较；源与目标相同则禁用翻译
+      const actualSrc = src === 'auto' ? d.srcCode : src;
+      if (sameLang(actualSrc, to)) {
+        if (bubbleId) {
+          try { callBackground({ type: 'cancel', id: bubbleId }); } catch (e) { /* ignore */ }
+        }
+        bubbleId = null;
+        bubbleReqId = null;
+        pendingPartialHandler = null;
+        tag.textContent = `${sourceLabelOf(actualSrc)} → ${targetLabelOf(to)}`;
+        body.className = 'body empty';
+        body.textContent = '源语言与目标语言相同，请选择不同的语言';
+        body.dataset.text = '';
+        copyBtn.disabled = true;
+        positionBubble(bubbleEl);
+        return;
+      }
+      startTranslation(d);
+      positionBubble(bubbleEl);
+    }
+
+    srcSel.addEventListener('change', applyDir);
+    toSel.addEventListener('change', applyDir);
+
+    if (dir.err) { showDirErr(dir); return; }
+    startTranslation(dir);
   }
 
   let pendingPartialHandler = null;
