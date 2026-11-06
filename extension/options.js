@@ -13,6 +13,7 @@ const DEFAULTS = {
   inputShortcut: 'Ctrl+Shift+Enter',
   debugFill: false,
   selectionEnabled: true,
+  paraClickEnabled: true,
   pageMode: 'dual',
   stylePreset: 'line',
   batchChars: 800,
@@ -426,6 +427,16 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 });
 
 load();
+
+/* popup 里改动的开关，已打开的设置页也要同步，无需刷新 */
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'sync') return;
+  if (changes.paraClickEnabled) {
+    const el = document.getElementById('paraClickEnabled');
+    if (el) el.checked = changes.paraClickEnabled.newValue !== false;
+  }
+  if (changes.inputShortcut && changes.inputShortcut.newValue) updateInputShortcutUI(changes.inputShortcut.newValue);
+});
 
 /* ---------------- 缓存统计 ---------------- */
 

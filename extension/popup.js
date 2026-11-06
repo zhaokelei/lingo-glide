@@ -62,6 +62,7 @@ function getSettings() {
     chrome.storage.sync.get({
       tripleSpaceEnabled: true,
       selectionEnabled: true,
+      paraClickEnabled: true,
       floatButton: true,
       targetLang: 'zh-Hans',
       sourceLang: 'auto',
@@ -228,6 +229,7 @@ async function refreshStatus() {
 }
 
 function applySettings(s) {
+  $('swPara').checked = s.paraClickEnabled !== false;
   $('swTriple').checked = !!s.tripleSpaceEnabled;
   $('swSelection').checked = !!s.selectionEnabled;
   $('swBall').checked = !!s.floatButton;
@@ -359,6 +361,10 @@ async function init() {
     refreshState();
   });
 
+  $('swPara').addEventListener('change', (e) => {
+    setSync({ paraClickEnabled: e.target.checked });
+    tip(e.target.checked ? '段落点击翻译已开启，当前页面即时生效' : '段落点击翻译已关闭，当前页面不再拦截 Ctrl+点击');
+  });
   $('swTriple').addEventListener('change', (e) => setSync({ tripleSpaceEnabled: e.target.checked }));
   $('swSelection').addEventListener('change', (e) => setSync({ selectionEnabled: e.target.checked }));
   $('swBall').addEventListener('change', (e) => setSync({ floatButton: e.target.checked }));
@@ -402,6 +408,8 @@ async function init() {
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'sync') return;
+    // 设置页改动开关后，已打开的 popup 立即同步，无需刷新
+    if (changes.paraClickEnabled) $('swPara').checked = changes.paraClickEnabled.newValue !== false;
     if (!changes.inputShortcut && !changes.shortcutTranslateEnabled) return;
     getSettings().then(renderShortcutHint);
   });

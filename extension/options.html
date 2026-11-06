@@ -203,6 +203,11 @@
       <input id="floatButton" type="checkbox">
       <span>显示右上角悬浮球（可拖动，点击展开语言卡片）</span>
     </label>
+    <label class="check">
+      <input id="paraClickEnabled" type="checkbox">
+      <span>段落点击翻译（按住 Ctrl + 左键点击段落，只翻译这一段）</span>
+    </label>
+    <em class="hint">开启时按住 Ctrl 悬停正文段落会临时高亮；点击只翻该段，并拦截段落内链接跳转，再次点击还原该段。关闭后完全不介入页面点击与悬停，Ctrl+点击链接照常跳转。</em>
     <p class="tip">触发方式：悬浮球、右键菜单「翻译此页 / 还原原文」、工具栏面板，或快捷键 <b id="shortcutText">Alt+T</b>（可在 <a href="#" id="shortcutLink">扩展快捷键页</a> 修改）。再次触发即还原原文。</p>
   </section>
 

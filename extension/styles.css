@@ -87,3 +87,13 @@ html.trf-page-hover .trf-src:hover .trf-tr-wrap > .trf-tr-block {
 [data-trf="failed"] {
   box-shadow: inset 0 -1px 0 rgba(220, 110, 90, 0.55) !important;
 }
+
+/* 按住 Ctrl 悬停命中段落：outline 不占布局、不触发回流；半透明底色深浅主题都可见 */
+[data-trf-para-hover] {
+  outline: 2px solid rgba(200, 169, 106, 0.92) !important;
+  outline-offset: 2px !important;
+  background-color: rgba(200, 169, 106, 0.16) !important;
+  border-radius: 3px !important;
+  cursor: pointer !important;
+  transition: none !important;
+}

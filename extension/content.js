@@ -27,6 +27,7 @@
     shortcutTranslateEnabled: true,
     inputShortcut: 'Ctrl+Shift+Enter',
     selectionEnabled: true,
+    paraClickEnabled: true,
     pageMode: 'dual',
     stylePreset: 'line',
     batchChars: 800,
@@ -169,6 +170,7 @@
   function onSettingsChanged() {
     if (!state.settings.selectionEnabled) hideSelectionIcon();
     if (!state.settings.tripleSpaceEnabled) spaceSeq.length = 0;
+    syncParaFeature();
     updateFloatButton();
     updateCard();
     applyPagePresentation();
@@ -901,6 +903,14 @@
       border-left-color: rgba(200,169,106,.45) !important;
     }
     [data-trf="failed"] { box-shadow: inset 0 -1px 0 rgba(220,110,90,.55) !important; }
+    [data-trf-para-hover] {
+      outline: 2px solid rgba(200,169,106,.92) !important;
+      outline-offset: 2px !important;
+      background-color: rgba(200,169,106,.16) !important;
+      border-radius: 3px !important;
+      cursor: pointer !important;
+      transition: none !important;
+    }
   `;
 
   const ui = (() => {
@@ -3230,6 +3240,11 @@
    *  真实环境中还会补一个 contextmenu。三个事件都接，350ms 内同一段只处理一次。 */
   function onParagraphTrigger(e) {
     e = e || window.event;
+    // 点击时取消待执行的高亮探测，避免 mouseup 后的定时器把高亮又点亮
+    clearTimeout(paraHoverTimer);
+    paraHoverTimer = 0;
+    paraHoverNode = null;
+    clearParaHover();
     if (!e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
     const isCtx = e.type === 'contextmenu';
     const isUp = e.type === 'mouseup';
@@ -3245,15 +3260,102 @@
       return;
     }
     lastParaHit = { block, at: now };
+    paraHoverSuppress = now + 500;
     // 链接跳转、新标签打开、系统右键菜单都在这里拦掉，段落翻译照常进行
     e.preventDefault();
     e.stopImmediatePropagation();
     runParagraphClick(block);
   }
 
-  window.addEventListener('click', onParagraphTrigger, true);
-  window.addEventListener('mouseup', onParagraphTrigger, true);
-  window.addEventListener('contextmenu', onParagraphTrigger, true);
+  /* ---- 按住 Ctrl 悬停：给命中的段落一个临时高亮（outline 不占布局，不引起回流） ---- */
+
+  const PARA_HOVER_ATTR = 'data-trf-para-hover';
+  let paraHoverEl = null;
+  let paraHoverTimer = 0;
+  let paraHoverNode = null;
+  let paraHoverSuppress = 0;   // 点击后短暂抑制高亮，避免 mouseup 后的 mousemove 立刻把它点亮
+
+  function clearParaHover() {
+    if (!paraHoverEl) return;
+    try { paraHoverEl.removeAttribute(PARA_HOVER_ATTR); } catch (e) { /* ignore */ }
+    paraHoverEl = null;
+  }
+
+  function setParaHover(block) {
+    if (paraHoverEl === block) return;
+    clearParaHover();
+    if (!block || !block.isConnected) return;
+    // 段落可能位于影子根内：该 root 没有页面样式表，需要补一份高亮样式
+    try {
+      const root = block.getRootNode && block.getRootNode();
+      if (root && root !== document && root.host) injectShadowStyles(root);
+    } catch (e) { /* ignore */ }
+    try { block.setAttribute(PARA_HOVER_ATTR, '1'); } catch (e) { return; }
+    paraHoverEl = block;
+  }
+
+  function probeParaHover() {
+    paraHoverTimer = 0;
+    const el = paraHoverNode;
+    paraHoverNode = null;
+    if (!state.settings.paraClickEnabled || !el || performance.now() < paraHoverSuppress) {
+      clearParaHover();
+      return;
+    }
+    setParaHover(paragraphForClick(el));
+  }
+
+  function onParaHoverMove(e) {
+    if (!state.settings.paraClickEnabled) { clearParaHover(); return; }
+    if (performance.now() < paraHoverSuppress) return;
+    if (!e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) { clearParaHover(); return; }
+    // composedPath 要在事件回调内取，才能穿透 shadow 边界拿到真实元素
+    paraHoverNode = clickElementFrom(e);
+    if (paraHoverTimer) return;
+    paraHoverTimer = setTimeout(probeParaHover, 60);
+  }
+
+  function onParaKeyUp(e) {
+    if (e.key === 'Control' || e.key === 'Meta') clearParaHover();
+  }
+
+  function onParaScroll() {
+    clearParaHover();
+  }
+
+  /** 开关关闭时完全不挂监听：Ctrl+点击链接照常跳转，页面零侵入 */
+  let paraBound = false;
+  function syncParaFeature() {
+    const on = state.settings.paraClickEnabled !== false;
+    if (on && !paraBound) {
+      window.addEventListener('click', onParagraphTrigger, true);
+      window.addEventListener('mouseup', onParagraphTrigger, true);
+      window.addEventListener('contextmenu', onParagraphTrigger, true);
+      window.addEventListener('mousemove', onParaHoverMove, true);
+      window.addEventListener('keyup', onParaKeyUp, true);
+      window.addEventListener('scroll', onParaScroll, true);
+      window.addEventListener('wheel', onParaScroll, true);
+      window.addEventListener('blur', clearParaHover);
+      paraBound = true;
+    } else if (!on && paraBound) {
+      window.removeEventListener('click', onParagraphTrigger, true);
+      window.removeEventListener('mouseup', onParagraphTrigger, true);
+      window.removeEventListener('contextmenu', onParagraphTrigger, true);
+      window.removeEventListener('mousemove', onParaHoverMove, true);
+      window.removeEventListener('keyup', onParaKeyUp, true);
+      window.removeEventListener('scroll', onParaScroll, true);
+      window.removeEventListener('wheel', onParaScroll, true);
+      window.removeEventListener('blur', clearParaHover);
+      paraBound = false;
+      lastParaHit = { block: null, at: 0 };
+    }
+    if (!on) {
+      clearTimeout(paraHoverTimer);
+      paraHoverTimer = 0;
+      paraHoverNode = null;
+      clearParaHover();
+    }
+  }
 
   /** MutationObserver 的增量扫描入口：交给 scanAllRoots，由其合并并发扫描 */
   function scanAndQueue() {
